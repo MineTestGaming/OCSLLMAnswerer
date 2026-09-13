@@ -1,7 +1,8 @@
 import json
 import os
-import re
+import socket
 from datetime import datetime
+from pathlib import Path
 
 from colorama import Fore, Style, init
 from dotenv import load_dotenv
@@ -9,8 +10,8 @@ from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
 from openai import OpenAI
 
-import socket
-from pathlib import Path
+from model_router import ModelRouter, RoutingConfig
+
 
 def patch_connect():
     ip = socket.gethostbyname(socket.gethostname())
@@ -20,7 +21,8 @@ def patch_connect():
 
     # 清理旧的动态 @connect
     lines = [
-        line for line in text.splitlines()
+        line
+        for line in text.splitlines()
         if not line.startswith("// @connect      172.")
     ]
 
@@ -30,14 +32,11 @@ def patch_connect():
     text = "\n".join(lines)
 
     if connect not in text:
-        text = text.replace(
-            marker,
-            f"{connect}\n{marker}",
-            1
-        )
+        text = text.replace(marker, f"{connect}\n{marker}", 1)
 
     path.write_text(text, encoding="utf-8")
     print(f"Patched userscript @connect -> {ip}", flush=True)
+
 
 # 初始化 colorama
 init(autoreset=True)
@@ -47,10 +46,7 @@ load_dotenv()
 
 app = Flask(__name__)
 
-CORS(
-    app,
-    resources={r"/*": {"origins": "*"}}
-)
+CORS(app, resources={r"/*": {"origins": "*"}})
 
 # 配置 OpenAI 客户端
 api_key = os.getenv("OPENAI_API_KEY")
@@ -105,9 +101,9 @@ TYPE_MAPPING = {
 }
 
 
-def get_chatgpt_answer(title, options, original_type):
+def build_question_messages(title, options, original_type):
     """
-    调用 ChatGPT 获取答案
+    原样构建现有题型 Prompt，供所有模型阶段复用。
     """
     # 转换题型为中文
     question_type = TYPE_MAPPING.get(original_type, original_type)
@@ -167,34 +163,28 @@ def get_chatgpt_answer(title, options, original_type):
   "analysis": "这里填写简短的解析"
 }}
 """
+    return [
+        {"role": "system", "content": "你是一个只输出 JSON 的专业做题助手。"},
+        {"role": "user", "content": prompt},
+    ]
+
+
+def get_chatgpt_answer(title, options, original_type):
+    """在原 Prompt 外围执行模型路由，不改写答案或解析。"""
     try:
-        response = client.chat.completions.create(
-            model=os.getenv("OPENAI_MODEL", "gpt-5.6-terra"),
-            messages=[
-                {"role": "system", "content": "你是一个只输出 JSON 的专业做题助手。"},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.3,
+        router = ModelRouter(client, RoutingConfig.from_env())
+        result = router.solve(
+            build_question_messages(title, options, original_type), title, original_type,
+            options=options,
         )
-        content = response.choices[0].message.content.strip()
-
-        # 清洗逻辑
-        content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
-        if content.startswith("```json"):
-            content = content[7:]
-        if content.endswith("```"):
-            content = content[:-3]
-        content = content.strip()
-
-        match = re.search(r"\{.*\}", content, re.DOTALL)
-        if match:
-            content = match.group(0)
-
-        result = json.loads(content)
+        log_info("模型路由: " + json.dumps(result["_meta"], ensure_ascii=False))
         return result
     except Exception as e:
-        log_error(f"OpenAI 调用或解析失败: {e}")
-        return {"answer": "未知", "analysis": "服务器处理出错"}
+        log_error(f"OpenAI 调用或解析失败: {type(e).__name__}")
+        return {
+            "answer": "未知", "analysis": "服务器处理出错",
+            "_meta": {"failed": True, "error_type": type(e).__name__},
+        }
 
 
 @app.route("/", methods=["GET", "HEAD"])
@@ -212,9 +202,15 @@ def search_answer():
             except Exception:
                 return jsonify({"code": 0, "msg": "无法解析 JSON 数据"}), 400
 
+        if not isinstance(data, dict):
+            return jsonify({"code": 0, "msg": "JSON 数据必须为对象"}), 400
+
         title = data.get("title", "")
         options = data.get("options", "")
         q_type = data.get("type", "Unknown")
+
+        if not all(isinstance(value, str) for value in (title, options, q_type)):
+            return jsonify({"code": 0, "msg": "title、options、type 必须为字符串"}), 400
 
         if options:
             # 清理选项：去除每一行的前后空格，并过滤掉空行，重新组合
@@ -222,7 +218,7 @@ def search_answer():
                 [line.strip() for line in options.split("\n") if line.strip()]
             )
 
-        if not title:
+        if not title.strip():
             return jsonify({"code": 0, "msg": "题目为空"}), 400
 
         # 获取中文题型名称用于日志显示
@@ -230,6 +226,9 @@ def search_answer():
         log_request(title, options, display_type)
 
         result = get_chatgpt_answer(title, options, q_type)
+
+        if result.get("_meta", {}).get("failed"):
+            return jsonify({"code": 0, "msg": "模型调用失败或答案格式无效"}), 502
 
         answer = result.get("answer", "未知")
         analysis = result.get("analysis", "无解析")
@@ -244,23 +243,20 @@ def search_answer():
         log_error(f"服务器内部错误: {e}")
         return jsonify({"code": 0, "msg": str(e)}), 500
 
-@app.route("/ocs.user.js")
-def get_plugin() :
-    return send_file(
-        "/app/ocs.user.js",
-        mimetype="application/javascript",
-        as_attachment=False
-    )
 
+@app.route("/ocs.user.js")
+def get_plugin():
+    return send_file(
+        "/app/ocs.user.js", mimetype="application/javascript", as_attachment=False
+    )
 
 
 if __name__ == "__main__":
     patch_connect()
     log_info(f"服务启动在 http://0.0.0.0:5000")
-    app.run(host="0.0.0.0", 
-        port=5000, 
-        ssl_context=(
-            "/certs/ocs-llm-answer.crt",
-            "/certs/ocs-llm-answer.key"
-        ),
-        debug=False)
+    app.run(
+        host="0.0.0.0",
+        port=5000,
+        ssl_context=("/certs/ocs-llm-answer.crt", "/certs/ocs-llm-answer.key"),
+        debug=False,
+    )
