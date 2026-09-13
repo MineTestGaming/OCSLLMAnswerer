@@ -1,0 +1,14 @@
+[project]
+name = "llmans"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "colorama>=0.4.6",
+    "flask>=3.1.3",
+    "flask-cors>=6.0.5",
+    "openai>=3.13.0",
+    "python-dotenv>=1.2.3",
+    "regex>=2026.9.10",
+]
