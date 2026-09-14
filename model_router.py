@@ -5,6 +5,8 @@ import os
 import re
 from dataclasses import dataclass
 
+from image_input import attach_images
+
 
 class InvalidAnswer(ValueError):
     """The provider did not return the required complete answer JSON."""
@@ -14,6 +16,7 @@ class InvalidAnswer(ValueError):
 class RoutingConfig:
     l1_model: str
     l2_model: str
+    vision_models: frozenset[str] = frozenset()
 
     @classmethod
     def from_env(cls, env=None):
@@ -22,7 +25,9 @@ class RoutingConfig:
                 or "gpt-5.6-terra")
         l1 = env.get("OPENAI_MODEL_L1") or main
         # No assumed provider model names: existing deployments remain usable.
-        return cls(l1, env.get("OPENAI_MODEL_L2") or main)
+        vision = frozenset(name.strip() for name in
+                           env.get("OPENAI_VISION_MODELS", "").split(",") if name.strip())
+        return cls(l1, env.get("OPENAI_MODEL_L2") or main, vision)
 
 
 def static_risk(title, question_type, options=""):
@@ -108,17 +113,19 @@ class ModelRouter:
         self.client = client
         self.config = config
 
-    def solve(self, messages, title, question_type, options=""):
+    def solve(self, messages, title, question_type, options="", images=None):
         attempts = []
         reasons = static_risk(title, question_type, options)
 
         def call(model):
             attempt = {"model": model, "status": "started"}
             attempts.append(attempt)
-            # Exactly the original system/user messages and temperature for
-            # every stage. No previous answer or new instructions are injected.
+            # Each stage chooses its own input modality. Text-only models see
+            # the same Image IDs, without image_url parts or OCR.
+            call_messages = (attach_images(messages, images)
+                             if images and model in self.config.vision_models else messages)
             response = self.client.chat.completions.create(
-                model=model, messages=messages, temperature=0.3,
+                model=model, messages=call_messages, temperature=0.3,
             )
             try:
                 if not response.choices:

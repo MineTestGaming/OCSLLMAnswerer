@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import socket
 from datetime import datetime
 from pathlib import Path
@@ -10,6 +11,7 @@ from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
 from openai import OpenAI
 
+from image_input import ImageAccessError, prepare_images
 from model_router import ModelRouter, RoutingConfig
 
 
@@ -170,17 +172,27 @@ def build_question_messages(title, options, original_type):
 
 
 def get_chatgpt_answer(title, options, original_type):
-    """在原 Prompt 外围执行模型路由，不改写答案或解析。"""
+    """准备图片并执行模型路由；仅还原答案中的图片引用。"""
     try:
+        title, options, images = prepare_images(title, options)
         router = ModelRouter(client, RoutingConfig.from_env())
         result = router.solve(
             build_question_messages(title, options, original_type),
             title,
             original_type,
             options=options,
+            images=images,
         )
         log_info("模型路由: " + json.dumps(result["_meta"], ensure_ascii=False))
+        if images:
+            # OCS still matches the original option contents, not internal IDs.
+            result["answer"] = re.sub(
+                r"\[Image \d+\]", lambda match: images.get(match.group(0), match.group(0)),
+                result["answer"],
+            )
         return result
+    except ImageAccessError:
+        raise
     except Exception as e:
         log_error(f"OpenAI 调用或解析失败: {type(e).__name__}")
         return {
@@ -228,7 +240,10 @@ def search_answer():
         display_type = TYPE_MAPPING.get(q_type, q_type)
         log_request(title, options, display_type)
 
-        result = get_chatgpt_answer(title, options, q_type)
+        try:
+            result = get_chatgpt_answer(title, options, q_type)
+        except ImageAccessError:
+            return jsonify({"code": 0, "msg": "图片无法访问或不是有效图片响应"}), 501
 
         if result.get("_meta", {}).get("failed"):
             return jsonify({"code": 0, "msg": "模型调用失败或答案格式无效"}), 502
