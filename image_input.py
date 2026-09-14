@@ -14,11 +14,13 @@ class ImageAccessError(ValueError):
     """An image could not be fetched as a nonempty image response."""
 
 
-def check_image(url):
+def check_image(url, user_agent=None):
     try:
         # GET also handles hosts that reject HEAD. Bound download size and
         # socket waits; never forward API credentials or browser cookies.
-        request = urllib.request.Request(url, headers={"User-Agent": "OCSLLMAnswerer/1.0"})
+        request = urllib.request.Request(
+            url, headers={"User-Agent": user_agent or "OCSLLMAnswerer/1.0"}
+        )
         with urllib.request.urlopen(request, timeout=10) as response:
             if not 200 <= response.status < 300:
                 raise ImageAccessError("图片请求失败")
@@ -32,7 +34,7 @@ def check_image(url):
         raise ImageAccessError("图片无法访问或不是有效图片响应") from exc
 
 
-def prepare_images(title, options):
+def prepare_images(title, options, user_agent=None):
     """Replace image URLs in occurrence order; duplicate links share an ID."""
     images = {}
 
@@ -42,7 +44,7 @@ def prepare_images(title, options):
         if not IMAGE_PATH.search(urlsplit(url).path):
             return match.group(0)
         if url not in images:
-            check_image(url)
+            check_image(url, user_agent=user_agent)
             images[url] = f"[Image {len(images) + 1}]"
         return images[url] + suffix
 

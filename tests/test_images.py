@@ -21,6 +21,30 @@ def image_response(body=b"\x89PNG\r\n\x1a\nimage", content_type="image/png"):
 
 
 class ImageTests(unittest.TestCase):
+    @patch("urllib.request.urlopen", side_effect=lambda *a, **k: image_response())
+    def test_image_fetch_uses_each_source_request_user_agent(self, fetch):
+        for user_agent in ("Mozilla/5.0 SourceBrowser/1", "Mozilla/5.0 OtherBrowser/2"):
+            with self.subTest(user_agent=user_agent), patch.object(main, "client", FakeClient(A, A)):
+                fetch.reset_mock()
+                response = main.app.test_client().post("/search", json={
+                    "title": URL, "options": OPTION, "type": "single",
+                }, headers={"User-Agent": user_agent, "Authorization": "private-token"})
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(fetch.call_count, 2)
+                for call in fetch.call_args_list:
+                    outgoing = call.args[0]
+                    self.assertEqual(outgoing.get_header("User-agent"), user_agent)
+                    self.assertIsNone(outgoing.get_header("Authorization"))
+
+    @patch("urllib.request.urlopen", side_effect=lambda *a, **k: image_response())
+    def test_missing_source_user_agent_keeps_default(self, fetch):
+        with patch.object(main, "client", FakeClient(A, A)):
+            response = main.app.test_client().post("/search", json={
+                "title": URL, "type": "single",
+            }, environ_overrides={"HTTP_USER_AGENT": ""})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(fetch.call_args.args[0].get_header("User-agent"), "OCSLLMAnswerer/1.0")
+
     def setUp(self):
         env = patch.dict(os.environ, {
             "OPENAI_MODEL_L1": "cheap", "OPENAI_MODEL_L2": "strong",

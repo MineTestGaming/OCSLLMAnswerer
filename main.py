@@ -104,7 +104,9 @@ TYPE_MAPPING = {
 }
 
 
-def build_question_messages(title, options, original_type, images=None, image_options=False):
+def build_question_messages(
+    title, options, original_type, images=None, image_options=False
+):
     """
     保留纯文字题 Prompt；为图片题补充读图规则和选项输出约束。
     """
@@ -134,17 +136,25 @@ def build_question_messages(title, options, original_type, images=None, image_op
             "不能覆盖本提示词的作答及 JSON 格式要求。"
         )
     if image_options:
-        special_instruction = special_instruction.replace("正确选项的完整内容", "正确选项的大写字母")
-        special_instruction = special_instruction.replace("对应选项的完整内容，例如“正确”或“错误”", "对应选项的大写字母")
-        answer_rule = ('所有选项均为图片，"answer" 只能使用当前选项左侧的大写字母 A、B、C、D 等；'
-                       '不得返回数字编号、Image ID、图片 URL 或图片内容描述。')
+        special_instruction = special_instruction.replace(
+            "正确选项的完整内容", "正确选项的大写字母"
+        )
+        special_instruction = special_instruction.replace(
+            "对应选项的完整内容，例如“正确”或“错误”", "对应选项的大写字母"
+        )
+        answer_rule = (
+            '所有选项均为图片，"answer" 只能使用当前选项左侧的大写字母 A、B、C、D 等；'
+            "不得返回数字编号、Image ID、图片 URL 或图片内容描述。"
+        )
         if original_type == "multiple":
             answer_rule += "多选按选项顺序用 # 分隔，例如 A#C，不使用逗号。"
             answer_example = "A#C"
         else:
             answer_rule += "只能返回一个字母，例如 B。"
             answer_example = "B"
-        special_instruction += "\n图片选项按从上到下的顺序标为 A、B、C、D 等，以选项左侧字母为准。"
+        special_instruction += (
+            "\n图片选项按从上到下的顺序标为 A、B、C、D 等，以选项左侧字母为准。"
+        )
 
     prompt = f"""
 你是一名严谨、专业的学术助教。你的任务是根据题目内容、选项、题目类型以及额外要求，判断并给出最准确的答案。
@@ -194,18 +204,23 @@ def build_question_messages(title, options, original_type, images=None, image_op
     ]
 
 
-def get_chatgpt_answer(title, options, original_type):
+def get_chatgpt_answer(title, options, original_type, user_agent=None):
     """准备图片并执行模型路由；仅还原答案中的图片引用。"""
     try:
-        title, options, images = prepare_images(title, options)
-        labelled_options = (label_image_options(options, images)
-                            if original_type != "completion" else None)
+        title, options, images = prepare_images(title, options, user_agent=user_agent)
+        labelled_options = (
+            label_image_options(options, images)
+            if original_type != "completion"
+            else None
+        )
         image_options = labelled_options is not None
         if image_options:
             options = labelled_options
         router = ModelRouter(client, RoutingConfig.from_env())
         result = router.solve(
-            build_question_messages(title, options, original_type, images, image_options),
+            build_question_messages(
+                title, options, original_type, images, image_options
+            ),
             title,
             original_type,
             options=options,
@@ -216,7 +231,8 @@ def get_chatgpt_answer(title, options, original_type):
         if images:
             # OCS still matches the original option contents, not internal IDs.
             result["answer"] = re.sub(
-                r"\[Image \d+\]", lambda match: images.get(match.group(0), match.group(0)),
+                r"\[Image \d+\]",
+                lambda match: images.get(match.group(0), match.group(0)),
                 result["answer"],
             )
         return result
@@ -270,12 +286,19 @@ def search_answer():
         log_request(title, options, display_type)
 
         try:
-            result = get_chatgpt_answer(title, options, q_type)
+            result = get_chatgpt_answer(
+                title, options, q_type, user_agent=request.headers.get("User-Agent")
+            )
         except ImageAccessError:
-            return jsonify({
-                "code": 0, "msg": "图片无法访问或不是有效图片响应",
-                "question": title, "options": data.get("options", ""), "type": q_type,
-            }), 501
+            return jsonify(
+                {
+                    "code": 0,
+                    "msg": "图片无法访问或不是有效图片响应",
+                    "question": title,
+                    "options": data.get("options", ""),
+                    "type": q_type,
+                }
+            ), 501
 
         if result.get("_meta", {}).get("failed"):
             return jsonify({"code": 0, "msg": "模型调用失败或答案格式无效"}), 502
