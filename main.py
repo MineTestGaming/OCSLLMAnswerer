@@ -174,7 +174,9 @@ def get_chatgpt_answer(title, options, original_type):
     try:
         router = ModelRouter(client, RoutingConfig.from_env())
         result = router.solve(
-            build_question_messages(title, options, original_type), title, original_type,
+            build_question_messages(title, options, original_type),
+            title,
+            original_type,
             options=options,
         )
         log_info("模型路由: " + json.dumps(result["_meta"], ensure_ascii=False))
@@ -182,7 +184,8 @@ def get_chatgpt_answer(title, options, original_type):
     except Exception as e:
         log_error(f"OpenAI 调用或解析失败: {type(e).__name__}")
         return {
-            "answer": "未知", "analysis": "服务器处理出错",
+            "answer": "未知",
+            "analysis": "服务器处理出错",
             "_meta": {"failed": True, "error_type": type(e).__name__},
         }
 
@@ -246,9 +249,13 @@ def search_answer():
 
 @app.route("/ocs.user.js")
 def get_plugin():
-    return send_file(
-        "/app/ocs.user.js", mimetype="application/javascript", as_attachment=False
-    )
+    try:
+        return send_file(
+            "/app/ocs.user.js", mimetype="application/javascript", as_attachment=False
+        )
+    except Exception as e:
+        log_error(f"脚本不存在: {e}")
+        return jsonify({"code": 0, "msg": str(e)}), 404
 
 
 if __name__ == "__main__":
@@ -257,6 +264,6 @@ if __name__ == "__main__":
     app.run(
         host="0.0.0.0",
         port=5000,
-        ssl_context=("/certs/ocs-llm-answer.crt", "/certs/ocs-llm-answer.key"),
+        # ssl_context=("/certs/ocs-llm-answer.crt", "/certs/ocs-llm-answer.key"),
         debug=False,
     )
