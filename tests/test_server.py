@@ -3,6 +3,7 @@ import os
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+import ssl
 
 from test_routing import A, B, FakeClient
 
@@ -55,6 +56,43 @@ class ServerTests(unittest.TestCase):
             with self.subTest(payload=payload), patch.object(main, "client", FakeClient()):
                 response = main.app.test_client().post("/search", json=payload)
                 self.assertEqual(response.status_code, 400)
+
+    def test_ssl_disabled_by_default(self):
+        self.assertIsNone(main.get_ssl_context({}))
+        self.assertIsNone(main.get_ssl_context({"SSL_ENABLED": "false"}))
+
+    def test_ssl_loads_configured_certificate_and_key(self):
+        with patch("ssl.SSLContext") as context_class:
+            context = main.get_ssl_context({
+                "SSL_ENABLED": "True", "SSL_CERT_FILE": "/certs/server.crt",
+                "SSL_KEY_FILE": "/certs/server.key",
+            })
+        self.assertIs(context, context_class.return_value)
+        context_class.assert_called_once_with(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain.assert_called_once_with("/certs/server.crt", "/certs/server.key")
+
+    def test_ssl_missing_settings_or_invalid_switch_fail(self):
+        for env in ({"SSL_ENABLED": "true"},
+                    {"SSL_ENABLED": "true", "SSL_CERT_FILE": "server.crt"},
+                    {"SSL_ENABLED": "typo"}):
+            with self.subTest(env=env), self.assertRaises(ValueError):
+                main.get_ssl_context(env)
+
+    def test_ssl_certificate_failure_does_not_fall_back_to_http(self):
+        with patch("ssl.SSLContext") as context_class:
+            context_class.return_value.load_cert_chain.side_effect = ssl.SSLError("bad certificate")
+            with self.assertRaises(ssl.SSLError):
+                main.get_ssl_context({"SSL_ENABLED": "1", "SSL_CERT_FILE": "bad.crt",
+                                      "SSL_KEY_FILE": "bad.key"})
+
+    def test_server_uses_ssl_context_and_logs_https(self):
+        context = object()
+        with patch.object(main, "get_ssl_context", return_value=context), \
+                patch.object(main, "patch_connect"), patch.object(main, "log_info") as log, \
+                patch.object(main.app, "run") as run:
+            main.run_server()
+        self.assertIs(run.call_args.kwargs["ssl_context"], context)
+        self.assertIn("https://", log.call_args.args[0])
 
 
 if __name__ == "__main__":

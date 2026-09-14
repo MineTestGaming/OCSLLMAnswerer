@@ -11,3 +11,6 @@ wheels/
 
 # Environment File
 .env
+
+# Test Env
+/app

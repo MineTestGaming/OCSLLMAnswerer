@@ -113,7 +113,7 @@ class ModelRouter:
         self.client = client
         self.config = config
 
-    def solve(self, messages, title, question_type, options="", images=None):
+    def solve(self, messages, title, question_type, options="", images=None, image_options=False):
         attempts = []
         reasons = static_risk(title, question_type, options)
 
@@ -124,6 +124,13 @@ class ModelRouter:
             # the same Image IDs, without image_url parts or OCR.
             call_messages = (attach_images(messages, images)
                              if images and model in self.config.vision_models else messages)
+            if images and model not in self.config.vision_models:
+                call_messages = [*messages[:-1], {
+                    **messages[-1], "content": messages[-1]["content"] +
+                    "\n本次未附图片，Image ID 仅为占位符。请依据剩余文字与知识尝试作答，"
+                    "不要假称看到了图片或编造图中细节；analysis 简要说明缺少图片导致的不确定性。"
+                    "仍须遵守上述 answer 格式和 JSON 要求。",
+                }]
             response = self.client.chat.completions.create(
                 model=model, messages=call_messages, temperature=0.3,
             )
@@ -131,6 +138,15 @@ class ModelRouter:
                 if not response.choices:
                     raise InvalidAnswer("模型未返回候选答案")
                 result = parse_answer(response.choices[0])
+                if image_options:
+                    pattern = r"[A-Z](?:#[A-Z])+" if question_type == "multiple" else r"[A-Z]"
+                    answer = result["answer"]
+                    labels = [row.split(".", 1)[0] for row in options.splitlines()]
+                    selected = answer.split("#")
+                    if (not re.fullmatch(pattern, answer)
+                            or any(label not in labels for label in selected)
+                            or selected != sorted(set(selected))):
+                        raise InvalidAnswer("纯图片选项须按顺序返回大写字母，多选用 # 分隔")
                 if question_type == "multiple":
                     multiple_answer_set(result["answer"], options)
             except InvalidAnswer:

@@ -64,3 +64,20 @@ def attach_images(messages, images):
     user["content"] = parts
     result[-1] = user
     return result
+
+
+def label_image_options(options, images):
+    """Label options only when every row contains known image IDs and no text."""
+    rows = [row.strip() for row in options.splitlines() if row.strip()]
+    if not rows or not images or len(rows) > 26:
+        return None
+    contents = []
+    for row in rows:
+        content = re.sub(r"^(?:[A-Z]|\d{1,2})[.．、:：)）]\s*", "", row)
+        ids = re.findall(r"\[Image \d+\]", content)
+        if (not ids or any(image_id not in images for image_id in ids)
+                or re.sub(r"\[Image \d+\]", "", content).strip()):
+            return None
+        contents.append(content)
+    return "\n".join(f"{chr(65 + index)}. {content}"
+                     for index, content in enumerate(contents))
