@@ -232,7 +232,9 @@ def get_chatgpt_answer(title, options, original_type, user_agent=None):
             # OCS still matches the original option contents, not internal IDs.
             result["answer"] = re.sub(
                 r"\[Image \d+\]",
-                lambda match: images.get(match.group(0), match.group(0)),
+                lambda match: (
+                    images[match.group(0)].url if match.group(0) in images else match.group(0)
+                ),
                 result["answer"],
             )
         return result

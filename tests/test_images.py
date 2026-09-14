@@ -1,4 +1,6 @@
 import io
+import base64
+import json
 import os
 import unittest
 from email.message import Message
@@ -83,11 +85,39 @@ class ImageTests(unittest.TestCase):
         self.assertIsInstance(parts, list)
         self.assertEqual(parts[1:], [
             {"type": "text", "text": "[Image 1]"},
-            {"type": "image_url", "image_url": {"url": URL}},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgppbWFnZQ=="}},
             {"type": "text", "text": "[Image 2]"},
-            {"type": "image_url", "image_url": {"url": OPTION}},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgppbWFnZQ=="}},
         ])
         self.assertEqual(fetch.call_count, 2)
+
+    def test_downloaded_bytes_and_mime_are_reused_for_each_vision_call(self):
+        bodies = {URL: (b"\x89PNG\r\n\x1a\nfirst", "image/png"),
+                  OPTION: (b"\xff\xd8\xffsecond", "image/jpeg")}
+        def download(request, **kwargs):
+            self.assertEqual(request.get_header("User-agent"), "SourceBrowser/1")
+            return image_response(*bodies[request.full_url])
+
+        with patch("urllib.request.urlopen", side_effect=download) as fetch, \
+                patch.dict(os.environ, {"OPENAI_VISION_MODELS": "cheap,strong"}), \
+                patch.object(main, "client", FakeClient(A, B, B)):
+            client = main.client
+            response = main.app.test_client().post("/search", json={
+                "title": URL, "options": OPTION + "\n" + URL, "type": "single",
+            }, headers={"User-Agent": "SourceBrowser/1"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(fetch.call_count, 2)
+        self.assertEqual(len(client.calls), 3)
+        for call in client.calls:
+            payload = json.dumps(call["messages"])
+            self.assertNotIn(URL, payload)
+            self.assertNotIn(OPTION, payload)
+            parts = call["messages"][1]["content"]
+            for part_index, url in ((2, URL), (4, OPTION)):
+                prefix, encoded = parts[part_index]["image_url"]["url"].split(",", 1)
+                body, mime = bodies[url]
+                self.assertEqual(prefix, "data:" + mime + ";base64")
+                self.assertEqual(base64.b64decode(encoded, validate=True), body)
 
     @patch("urllib.request.urlopen", side_effect=lambda *a, **k: image_response())
     def test_duplicate_images_reuse_id_and_are_fetched_once(self, fetch):

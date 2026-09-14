@@ -1,7 +1,9 @@
 """Validate image links and prepare per-request image references; no OCR."""
 
+import base64
 import re
 import urllib.request
+from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
 
@@ -14,7 +16,14 @@ class ImageAccessError(ValueError):
     """An image could not be fetched as a nonempty image response."""
 
 
+@dataclass(frozen=True)
+class ImageReference:
+    url: str
+    data_url: str = field(repr=False)
+
+
 def check_image(url, user_agent=None):
+    """Download once using the source UA and return a Base64 image data URL."""
     try:
         # GET also handles hosts that reject HEAD. Bound download size and
         # socket waits; never forward API credentials or browser cookies.
@@ -30,6 +39,8 @@ def check_image(url, user_agent=None):
             body = response.read(MAX_IMAGE_BYTES + 1)
             if not body or len(body) > MAX_IMAGE_BYTES:
                 raise ImageAccessError("图片为空或超过 20 MiB")
+            encoded = base64.b64encode(body).decode("ascii")
+            return f"data:{mime};base64,{encoded}"
     except Exception as exc:
         raise ImageAccessError("图片无法访问或不是有效图片响应") from exc
 
@@ -37,6 +48,7 @@ def check_image(url, user_agent=None):
 def prepare_images(title, options, user_agent=None):
     """Replace image URLs in occurrence order; duplicate links share an ID."""
     images = {}
+    references = {}
 
     def replace(match):
         url = match.group(0).rstrip(".,;!?)）]}")
@@ -44,13 +56,15 @@ def prepare_images(title, options, user_agent=None):
         if not IMAGE_PATH.search(urlsplit(url).path):
             return match.group(0)
         if url not in images:
-            check_image(url, user_agent=user_agent)
-            images[url] = f"[Image {len(images) + 1}]"
+            data_url = check_image(url, user_agent=user_agent)
+            image_id = f"[Image {len(images) + 1}]"
+            images[url] = image_id
+            references[image_id] = ImageReference(url, data_url)
         return images[url] + suffix
 
     title = URL_PATTERN.sub(replace, title)
     options = URL_PATTERN.sub(replace, options)
-    return title, options, {image_id: url for url, image_id in images.items()}
+    return title, options, references
 
 
 def attach_images(messages, images):
@@ -58,10 +72,10 @@ def attach_images(messages, images):
     result = list(messages)
     user = dict(result[-1])
     parts = [{"type": "text", "text": user["content"]}]
-    for image_id, url in images.items():
+    for image_id, reference in images.items():
         parts.extend((
             {"type": "text", "text": image_id},
-            {"type": "image_url", "image_url": {"url": url}},
+            {"type": "image_url", "image_url": {"url": reference.data_url}},
         ))
     user["content"] = parts
     result[-1] = user
