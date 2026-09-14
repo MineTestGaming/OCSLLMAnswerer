@@ -11,6 +11,10 @@ from image_input import attach_images
 class InvalidAnswer(ValueError):
     """The provider did not return the required complete answer JSON."""
 
+    def __init__(self, message):
+        super().__init__(message)
+        self.diagnostics = {}
+
 
 @dataclass(frozen=True)
 class RoutingConfig:
@@ -149,8 +153,18 @@ class ModelRouter:
                         raise InvalidAnswer("纯图片选项须按顺序返回大写字母，多选用 # 分隔")
                 if question_type == "multiple":
                     multiple_answer_set(result["answer"], options)
-            except InvalidAnswer:
+            except InvalidAnswer as exc:
                 attempt["status"] = "invalid"
+                choice = response.choices[0] if response.choices else None
+                message = getattr(choice, "message", None)
+                # Preserve the original output, including whitespace, fences,
+                # think tags and partial JSON. Never include the request payload.
+                exc.diagnostics = {
+                    "model": model,
+                    "raw_output": getattr(message, "content", None),
+                    "finish_reason": getattr(choice, "finish_reason", None),
+                    "refusal": getattr(message, "refusal", None),
+                }
                 raise
             attempt.update(status="valid", answer=result["answer"])
             return result

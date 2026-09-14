@@ -13,7 +13,7 @@ from flask_cors import CORS
 from openai import OpenAI
 
 from image_input import ImageAccessError, label_image_options, prepare_images
-from model_router import ModelRouter, RoutingConfig
+from model_router import InvalidAnswer, ModelRouter, RoutingConfig
 
 
 def patch_connect():
@@ -233,7 +233,9 @@ def get_chatgpt_answer(title, options, original_type, user_agent=None):
             result["answer"] = re.sub(
                 r"\[Image \d+\]",
                 lambda match: (
-                    images[match.group(0)].url if match.group(0) in images else match.group(0)
+                    images[match.group(0)].url
+                    if match.group(0) in images
+                    else match.group(0)
                 ),
                 result["answer"],
             )
@@ -241,11 +243,20 @@ def get_chatgpt_answer(title, options, original_type, user_agent=None):
     except ImageAccessError:
         raise
     except Exception as e:
-        log_error(f"OpenAI 调用或解析失败: {type(e).__name__}")
+        reason = (
+            str(e) if isinstance(e, InvalidAnswer) else "模型调用失败，未取得有效输出"
+        )
+        diagnostics = e.diagnostics if isinstance(e, InvalidAnswer) else {}
+        log_error(f"OpenAI 调用或解析失败: {type(e).__name__}: {reason}")
         return {
             "answer": "未知",
             "analysis": "服务器处理出错",
-            "_meta": {"failed": True, "error_type": type(e).__name__},
+            "_meta": {
+                "failed": True,
+                "error_type": type(e).__name__,
+                "reason": reason,
+                **diagnostics,
+            },
         }
 
 
@@ -303,7 +314,19 @@ def search_answer():
             ), 501
 
         if result.get("_meta", {}).get("failed"):
-            return jsonify({"code": 0, "msg": "模型调用失败或答案格式无效"}), 502
+            meta = result["_meta"]
+            return jsonify(
+                {
+                    "code": 0,
+                    "msg": "模型调用失败或答案格式无效",
+                    "raw_output": meta.get("raw_output"),
+                    "model": meta.get("model"),
+                    "finish_reason": meta.get("finish_reason"),
+                    "refusal": meta.get("refusal"),
+                    "error_type": meta.get("error_type"),
+                    "reason": meta.get("reason"),
+                }
+            ), 502
 
         answer = result.get("answer", "未知")
         analysis = result.get("analysis", "无解析")

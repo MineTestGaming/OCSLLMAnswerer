@@ -3,6 +3,7 @@ import os
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from types import SimpleNamespace
 import ssl
 
 from test_routing import A, B, FakeClient
@@ -49,6 +50,49 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(response.status_code, 502)
         self.assertEqual(response.json["code"], 0)
         self.assertNotIn("private-provider-detail", response.get_data(as_text=True))
+        self.assertIsNone(response.json["raw_output"])
+        self.assertEqual(response.json["error_type"], "TimeoutError")
+
+    def test_502_returns_final_model_output_before_any_cleanup(self):
+        raw = '  <think>原始思考</think>\n```json\n{"answer":"A"}\n```  '
+        with patch.object(main, "client", FakeClient("first invalid", raw)):
+            response = main.app.test_client().post("/search", json={
+                "title": "题目", "options": "甲\n乙", "type": "single",
+            })
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(response.json["code"], 0)
+        self.assertEqual(response.json["raw_output"], raw)
+        self.assertEqual(response.json["model"], "strong")
+        self.assertEqual(response.json["finish_reason"], "stop")
+        self.assertEqual(response.json["reason"], "模型输出必须且只能包含 answer 和 analysis")
+
+    def test_502_preserves_truncated_or_refused_output(self):
+        for content, finish, refusal in (("{\"answer\":", "length", None),
+                                         (None, "stop", "拒绝内容")):
+            with self.subTest(finish=finish):
+                client = FakeClient()
+                reply = SimpleNamespace(choices=[SimpleNamespace(
+                    message=SimpleNamespace(content=content, refusal=refusal), finish_reason=finish,
+                )])
+                with patch.object(main, "client", client), patch.object(client, "create", return_value=reply):
+                    response = main.app.test_client().post("/search", json={
+                        "title": "不正确的是", "type": "single",
+                    })
+                self.assertEqual(response.status_code, 502)
+                self.assertEqual(response.json["raw_output"], content)
+                self.assertEqual(response.json["finish_reason"], finish)
+                self.assertEqual(response.json["refusal"], refusal)
+
+    def test_502_without_choices_has_no_raw_output(self):
+        client = FakeClient()
+        with patch.object(main, "client", client), \
+                patch.object(client, "create", return_value=SimpleNamespace(choices=[])):
+            response = main.app.test_client().post("/search", json={
+                "title": "不正确的是", "type": "single",
+            })
+        self.assertEqual(response.status_code, 502)
+        self.assertIsNone(response.json["raw_output"])
+        self.assertEqual(response.json["reason"], "模型未返回候选答案")
 
     def test_malformed_request_returns_400_without_model_call(self):
         for payload in ([], {"title": 1}, {"title": "题", "options": []},
