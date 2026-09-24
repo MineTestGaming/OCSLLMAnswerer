@@ -361,10 +361,12 @@ def get_ssl_context(env=None):
         return None
     if enabled not in ("1", "true", "yes", "on"):
         raise ValueError("SSL_ENABLED 必须为 true/false、1/0、yes/no 或 on/off")
-    cert = env.get("SSL_CERT_FILE", "").strip()
-    key = env.get("SSL_KEY_FILE", "").strip()
+    cert = env.get("SSL_SERVER_CERT_FILE", "").strip()
+    key = env.get("SSL_SERVER_KEY_FILE", "").strip()
     if not cert or not key:
-        raise ValueError("启用 SSL 时必须配置 SSL_CERT_FILE 和 SSL_KEY_FILE")
+        raise ValueError(
+            "启用 SSL 时必须配置 SSL_SERVER_CERT_FILE 和 SSL_SERVER_KEY_FILE"
+        )
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(cert, key)
     return context

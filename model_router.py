@@ -68,7 +68,15 @@ def parse_answer(choice):
     try:
         result = json.loads(content)
     except (ValueError, TypeError) as exc:
-        raise InvalidAnswer("模型输出不是合法 JSON") from exc
+        # Some compatible providers append a bare ellipsis even when
+        # json_object mode is requested. Accept only that exact benign suffix;
+        # explanatory prose and additional values remain invalid.
+        try:
+            result, end = json.JSONDecoder().raw_decode(content)
+        except (ValueError, TypeError):
+            raise InvalidAnswer("模型输出不是合法 JSON") from exc
+        if content[end:].strip() not in ("...", "…"):
+            raise InvalidAnswer("模型输出不是合法 JSON") from exc
     if not isinstance(result, dict) or set(result) != {"answer", "analysis"}:
         raise InvalidAnswer("模型输出必须且只能包含 answer 和 analysis")
     if not isinstance(result["answer"], str) or not result["answer"].strip():
@@ -136,7 +144,10 @@ class ModelRouter:
                     "仍须遵守上述 answer 格式和 JSON 要求。",
                 }]
             response = self.client.chat.completions.create(
-                model=model, messages=call_messages, temperature=0.3,
+                model=model,
+                messages=call_messages,
+                temperature=0.3,
+                response_format={"type": "json_object"},
             )
             try:
                 if not response.choices:

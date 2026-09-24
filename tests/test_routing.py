@@ -56,6 +56,7 @@ class RoutingTests(unittest.TestCase):
         for call in calls:
             self.assertEqual(call["messages"], MESSAGES)
             self.assertEqual(call["temperature"], 0.3)
+            self.assertEqual(call["response_format"], {"type": "json_object"})
             self.assertNotIn("logprobs", call)
 
     def test_high_risk_types_go_directly_to_strong_model(self):
@@ -88,6 +89,20 @@ class RoutingTests(unittest.TestCase):
                 result, calls = self.solve(bad, B)
                 self.assertEqual(result["answer"], "B")
                 self.assertEqual([c["model"] for c in calls], ["cheap", "strong"])
+
+    def test_provider_trailing_ellipsis_is_supported(self):
+        payload = json.dumps(A, ensure_ascii=False)
+        for suffix in ("...", "…"):
+            with self.subTest(suffix=suffix):
+                result, calls = self.solve(payload + suffix, payload + suffix)
+                self.assertEqual(result["answer"], "A")
+                self.assertEqual([c["model"] for c in calls], ["cheap", "cheap"])
+
+    def test_arbitrary_text_after_json_is_rejected(self):
+        payload = json.dumps(A, ensure_ascii=False)
+        result, calls = self.solve(payload + " explanation", B)
+        self.assertEqual(result["answer"], "B")
+        self.assertEqual([c["model"] for c in calls], ["cheap", "strong"])
 
     def test_invalid_verifier_escalates(self):
         result, calls = self.solve(A, "invalid", B)

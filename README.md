@@ -42,8 +42,8 @@ pip install -r requirements.txt
 
 ```dotenv
 SSL_ENABLED=true
-SSL_CERT_FILE=/certs/ocs-llm-answer.crt
-SSL_KEY_FILE=/certs/ocs-llm-answer.key
+SSL_SERVER_CERT_FILE=/certs/ocs-llm-answer.crt
+SSL_SERVER_KEY_FILE=/certs/ocs-llm-answer.key
 ```
 
 默认 `SSL_ENABLED=false`，使用 HTTP。改为 `true` 并重启后，5000 端口使用 HTTPS，
@@ -53,11 +53,21 @@ OCS 的 `homepage`、`url` 也应改用 `https://`，例如 `https://ocs-llm-ans
 关闭 SSL 时不读取证书文件。相对路径以进程工作目录为基准；Windows 可使用
 `C:/certs/server.crt` 形式的路径，Docker 中须使用容器内路径并挂载证书文件。
 浏览器须信任证书，且访问主机名须与证书匹配。这里配置的是文件路径，不是证书内容。
+不要使用 Python/OpenSSL 保留变量 `SSL_CERT_FILE` 指定服务器证书；它会覆盖出站
+HTTPS 的 CA 信任库，导致模型 API 证书校验失败。
+
+使用仓库根目录的 Compose 时，答题服务会读取 `LlmAns/.env`，并与桌面容器共享
+Tailscale 网络命名空间。OCS 配置中的地址必须保持为
+`https://ocs-llm-answer:5000`：证书仅包含该主机名，不能改成 `localhost` 或 IP。
+桌面镜像会在 root 初始化阶段安装 CA，并把该主机名映射到共享命名空间的
+`127.0.0.1`；不要在 Compose 中添加 `extra_hosts`，它与
+`network_mode: service:tailscale` 不兼容。
 
 ## 模型升级与独立复核
 
 纯文字题原有各题型 Prompt、system 消息、JSON `answer` / `analysis` 要求和
-`temperature=0.3` 保持不变。L1、复核和 L2 都使用完全相同的 Prompt，
+`temperature=0.3` 保持不变。模型调用使用 OpenAI 兼容的 JSON 响应模式，避免
+供应商在合法 JSON 后追加省略号或解释文字。L1、复核和 L2 都使用完全相同的 Prompt，
 不注入前一次答案，不追加置信度指令。服务不将答案转换为字母或完整选项，
 而是直接返回最终选中响应的 `answer` 和 `analysis`。图片题的 Image ID
 会在答案返回时还原为原图片链接，详见下方图片输入说明。

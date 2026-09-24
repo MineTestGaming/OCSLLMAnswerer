@@ -108,8 +108,9 @@ class ServerTests(unittest.TestCase):
     def test_ssl_loads_configured_certificate_and_key(self):
         with patch("ssl.SSLContext") as context_class:
             context = main.get_ssl_context({
-                "SSL_ENABLED": "True", "SSL_CERT_FILE": "/certs/server.crt",
-                "SSL_KEY_FILE": "/certs/server.key",
+                "SSL_ENABLED": "True",
+                "SSL_SERVER_CERT_FILE": "/certs/server.crt",
+                "SSL_SERVER_KEY_FILE": "/certs/server.key",
             })
         self.assertIs(context, context_class.return_value)
         context_class.assert_called_once_with(ssl.PROTOCOL_TLS_SERVER)
@@ -117,7 +118,7 @@ class ServerTests(unittest.TestCase):
 
     def test_ssl_missing_settings_or_invalid_switch_fail(self):
         for env in ({"SSL_ENABLED": "true"},
-                    {"SSL_ENABLED": "true", "SSL_CERT_FILE": "server.crt"},
+                    {"SSL_ENABLED": "true", "SSL_SERVER_CERT_FILE": "server.crt"},
                     {"SSL_ENABLED": "typo"}):
             with self.subTest(env=env), self.assertRaises(ValueError):
                 main.get_ssl_context(env)
@@ -126,8 +127,11 @@ class ServerTests(unittest.TestCase):
         with patch("ssl.SSLContext") as context_class:
             context_class.return_value.load_cert_chain.side_effect = ssl.SSLError("bad certificate")
             with self.assertRaises(ssl.SSLError):
-                main.get_ssl_context({"SSL_ENABLED": "1", "SSL_CERT_FILE": "bad.crt",
-                                      "SSL_KEY_FILE": "bad.key"})
+                main.get_ssl_context({
+                    "SSL_ENABLED": "1",
+                    "SSL_SERVER_CERT_FILE": "bad.crt",
+                    "SSL_SERVER_KEY_FILE": "bad.key",
+                })
 
     def test_server_uses_ssl_context_and_logs_https(self):
         context = object()
