@@ -7,6 +7,8 @@ from types import SimpleNamespace
 import ssl
 
 from test_routing import A, B, FakeClient
+from jev_router import L0Result
+from test_routing import FakeJevRouter
 
 # Prevent loading the developer's .env or using a real API key in tests.
 with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}, clear=True), \
@@ -43,6 +45,23 @@ class ServerTests(unittest.TestCase):
             })
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json, {"code": 1, "question": "题目", **answer})
+
+    def test_search_jev_direct_keeps_json_contract(self):
+        jev = FakeJevRouter(L0Result(
+            "B. 乙", "l0_direct", 1.0, 1.0, "jev-test", 0.990,
+        ))
+        with patch.object(main, "jev_router", jev), \
+                patch.object(main, "client", FakeClient()):
+            response = main.app.test_client().post("/search", json={
+                "title": "1 + 1 = ?", "options": "A. 1\nB. 乙", "type": "single",
+            })
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json, {
+            "code": 1,
+            "question": "1 + 1 = ?",
+            "answer": "B. 乙",
+            "analysis": "Jev L0 高置信度直答（99.0%+）",
+        })
 
     def test_provider_failure_is_not_reported_as_success(self):
         with patch.object(main, "client", FakeClient(TimeoutError("private-provider-detail"))):

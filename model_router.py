@@ -121,9 +121,10 @@ def multiple_answer_set(answer, options):
 
 
 class ModelRouter:
-    def __init__(self, client, config):
+    def __init__(self, client, config, jev_router=None):
         self.client = client
         self.config = config
+        self.jev_router = jev_router
 
     def solve(self, messages, title, question_type, options="", images=None, image_options=False):
         attempts = []
@@ -180,19 +181,50 @@ class ModelRouter:
             attempt.update(status="valid", answer=result["answer"])
             return result
 
-        def finish(result, model, route):
+        def finish(result, model, route, confidence=None,
+                   confidence_method="independent_answer_agreement"):
             return {**result, "_meta": {
                 "model": model,
                 "route": route,
                 "upgraded": route == "escalated_l2" and self.config.l1_model != model,
                 "reasons": reasons,
                 "attempts": attempts,
-                "confidence": None,
-                "confidence_method": "independent_answer_agreement",
+                "confidence": confidence,
+                "confidence_method": confidence_method,
             }}
 
         if reasons:
             return finish(call(self.config.l2_model), self.config.l2_model, "direct_l2")
+
+        if (self.jev_router is not None and not images and not image_options
+                and question_type in ("single", "judgement")):
+            l0 = self.jev_router.solve(title, options, question_type)
+            if l0 is not None:
+                attempts.append({
+                    "model": l0.model,
+                    "status": "valid",
+                    "route": l0.route,
+                    "answer_probability": l0.answer_probability,
+                    "route_probability": l0.route_probability,
+                })
+                if l0.route == "direct_l2":
+                    reasons.append("jev_direct_l2")
+                    return finish(
+                        call(self.config.l2_model), self.config.l2_model, "direct_l2"
+                    )
+                if l0.can_answer_directly:
+                    reasons.append("jev_high_confidence")
+                    return finish(
+                        {
+                            "answer": l0.answer,
+                            "analysis": "Jev L0 高置信度直答（99.0%+）",
+                        },
+                        l0.model,
+                        "jev_l0_direct",
+                        min(l0.answer_probability, l0.route_probability),
+                        "jev_system_one",
+                    )
+                reasons.append("jev_verify_l1")
 
         try:
             first = call(self.config.l1_model)

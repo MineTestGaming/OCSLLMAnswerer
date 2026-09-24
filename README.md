@@ -98,6 +98,27 @@ OPENAI_MODEL_L2=你的强模型
 这些是路由层调用次数，OpenAI SDK 自身的网络重试另计。
 静态关键词是初始启发规则，可以在 `model_router.py` 的 `static_risk` 中调整。
 
+### Jev L0 快速路由
+
+可选的 Jev System One L0 层只处理无图片、未命中静态风险规则的单选题和判断题。
+它从题目原始选项中选择答案，并同时给出 `l0_direct`、`verify_l1` 或
+`direct_l2` 路由。候选答案和 `l0_direct` 路由的归一化概率都达到阈值时，
+服务直接返回原始选项文本；否则沿用 L1 独立复核流程。`direct_l2` 会直接进入 L2。
+图片题、多选题、填空题、无法唯一解析选项的题目不会调用 Jev。
+
+```dotenv
+JEV_ENABLED=true
+TYPESAFE_API_KEY=你的TypeSafe API Key
+JEV_MODEL=jev-latest
+JEV_DIRECT_CONFIDENCE=0.990
+```
+
+Jev 默认关闭。缺少 Key、配置非法、初始化失败、超时、网络错误或响应无效时，
+服务会静默回退到原有 L1/L2 路由，不影响启动和 `/search` 的成功/失败语义。
+L0 直答的固定解析为 `Jev L0 高置信度直答（99.0%+）`。运行日志只包含模型、
+路由及归一化概率，不记录 API Key、Authorization 请求头或完整 SDK 响应。
+启用后，符合条件的题干与选项会发送给 TypeSafe AI，图片不会发送。
+
 为遵守原 Prompt，本版本不请求 `logprobs`，也不把 JSON token 的生成概率
 或模型自报数字当成答对概率。独立调用可能重复同一个错误，一致性不能保证正确。
 单选、判断、填空的答案比较只忽略首尾空白。

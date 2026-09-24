@@ -3,6 +3,7 @@ import unittest
 from types import SimpleNamespace
 
 from model_router import ModelRouter, RoutingConfig, InvalidAnswer
+from jev_router import L0Result
 
 
 class FakeClient:
@@ -28,6 +29,16 @@ MESSAGES = [{"role": "system", "content": "原 system"},
             {"role": "user", "content": "原 Prompt，含 JSON 输出要求"}]
 A = {"answer": "A", "analysis": "原解析"}
 B = {"answer": "B", "analysis": "复核后的解析"}
+
+
+class FakeJevRouter:
+    def __init__(self, result):
+        self.result = result
+        self.calls = []
+
+    def solve(self, title, options, question_type):
+        self.calls.append((title, options, question_type))
+        return self.result
 
 
 class RoutingTests(unittest.TestCase):
@@ -188,6 +199,68 @@ class RoutingTests(unittest.TestCase):
         with self.assertRaises(InvalidAnswer):
             self.solve({"answer": "A#Z", "analysis": "说明"}, kind="multiple",
                        title="以下不正确的是")
+
+    def test_jev_high_confidence_returns_original_option_without_openai_call(self):
+        client = FakeClient()
+        jev = FakeJevRouter(L0Result(
+            "B. 乙", "l0_direct", 0.990, 0.990, "jev-test", 0.990,
+        ))
+        result = ModelRouter(
+            client, RoutingConfig("cheap", "strong"), jev_router=jev,
+        ).solve(MESSAGES, "普通题", "single", options="A. 甲\nB. 乙")
+        self.assertEqual(result["answer"], "B. 乙")
+        self.assertEqual(result["analysis"], "Jev L0 高置信度直答（99.0%+）")
+        self.assertEqual(result["_meta"]["route"], "jev_l0_direct")
+        self.assertEqual(result["_meta"]["confidence"], 0.990)
+        self.assertEqual(client.calls, [])
+
+    def test_jev_low_confidence_or_verify_route_uses_existing_l1_flow(self):
+        for route, answer_probability, route_probability in (
+            ("l0_direct", 0.989, 1.0),
+            ("l0_direct", 1.0, 0.989),
+            ("verify_l1", 1.0, 1.0),
+        ):
+            with self.subTest(route=route, ap=answer_probability, rp=route_probability):
+                client = FakeClient(A, A)
+                jev = FakeJevRouter(L0Result(
+                    "A. 甲", route, answer_probability, route_probability,
+                    "jev-test", 0.990,
+                ))
+                result = ModelRouter(
+                    client, RoutingConfig("cheap", "strong"), jev_router=jev,
+                ).solve(MESSAGES, "普通题", "single", options="A. 甲\nB. 乙")
+                self.assertEqual(result["_meta"]["route"], "verified_l1")
+                self.assertEqual([call["model"] for call in client.calls], ["cheap", "cheap"])
+
+    def test_jev_direct_l2_skips_l1(self):
+        client = FakeClient(B)
+        jev = FakeJevRouter(L0Result(
+            "A. 甲", "direct_l2", 0.6, 0.6, "jev-test", 0.990,
+        ))
+        result = ModelRouter(
+            client, RoutingConfig("cheap", "strong"), jev_router=jev,
+        ).solve(MESSAGES, "普通题", "single", options="A. 甲\nB. 乙")
+        self.assertEqual(result["_meta"]["route"], "direct_l2")
+        self.assertEqual([call["model"] for call in client.calls], ["strong"])
+
+    def test_static_risk_images_and_other_types_skip_jev(self):
+        cases = (
+            {"title": "以下不正确的是", "kind": "single", "images": None},
+            {"title": "普通题", "kind": "single", "images": {"[Image 1]": object()}},
+            {"title": "普通题", "kind": "multiple", "images": None},
+            {"title": "普通题", "kind": "completion", "images": None},
+        )
+        for case in cases:
+            with self.subTest(case=case):
+                answer = ({"answer": "A#B", "analysis": "说明"}
+                          if case["kind"] == "multiple" else B)
+                client = FakeClient(answer, answer)
+                jev = FakeJevRouter(None)
+                ModelRouter(
+                    client, RoutingConfig("cheap", "strong"), jev_router=jev,
+                ).solve(MESSAGES, case["title"], case["kind"],
+                        options="A. 甲\nB. 乙", images=case["images"])
+                self.assertEqual(jev.calls, [])
 
 
 if __name__ == "__main__":

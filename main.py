@@ -13,6 +13,7 @@ from flask_cors import CORS
 from openai import OpenAI
 
 from image_input import ImageAccessError, label_image_options, prepare_images
+from jev_router import JevRouter
 from model_router import InvalidAnswer, ModelRouter, RoutingConfig
 
 
@@ -59,6 +60,7 @@ if not api_key:
     print(Fore.RED + "Warning: OPENAI_API_KEY is not set in environment variables.")
 
 client = OpenAI(api_key=api_key, base_url=base_url if base_url else None)
+jev_router = JevRouter.from_env()
 
 
 def log_info(msg):
@@ -216,7 +218,7 @@ def get_chatgpt_answer(title, options, original_type, user_agent=None):
         image_options = labelled_options is not None
         if image_options:
             options = labelled_options
-        router = ModelRouter(client, RoutingConfig.from_env())
+        router = ModelRouter(client, RoutingConfig.from_env(), jev_router=jev_router)
         result = router.solve(
             build_question_messages(
                 title, options, original_type, images, image_options

@@ -4,3 +4,4 @@ openai
 python-dotenv
 colorama
 regex
+typesafe-sdk==0.7.1
