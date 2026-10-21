@@ -5,7 +5,12 @@ import os
 import re
 from dataclasses import dataclass
 
+from openai import OpenAIError
+
 from image_input import attach_images
+
+
+MODEL_CALL_ERRORS = (OpenAIError, TimeoutError, ConnectionError)
 
 
 class InvalidAnswer(ValueError):
@@ -144,12 +149,16 @@ class ModelRouter:
                     "不要假称看到了图片或编造图中细节；analysis 简要说明缺少图片导致的不确定性。"
                     "仍须遵守上述 answer 格式和 JSON 要求。",
                 }]
-            response = self.client.chat.completions.create(
-                model=model,
-                messages=call_messages,
-                temperature=0.3,
-                response_format={"type": "json_object"},
-            )
+            try:
+                response = self.client.chat.completions.create(
+                    model=model,
+                    messages=call_messages,
+                    temperature=0.3,
+                    response_format={"type": "json_object"},
+                )
+            except MODEL_CALL_ERRORS as exc:
+                attempt.update(status="failed", error_type=type(exc).__name__)
+                raise
             try:
                 if not response.choices:
                     raise InvalidAnswer("模型未返回候选答案")
@@ -230,11 +239,15 @@ class ModelRouter:
             first = call(self.config.l1_model)
         except InvalidAnswer:
             reasons.append("invalid_l1_output")
+        except MODEL_CALL_ERRORS:
+            reasons.append("l1_call_failed")
         else:
             try:
                 second = call(self.config.l1_model)
             except InvalidAnswer:
                 reasons.append("invalid_verifier_output")
+            except MODEL_CALL_ERRORS:
+                reasons.append("verifier_call_failed")
             else:
                 if question_type == "multiple":
                     agrees = (multiple_answer_set(first["answer"], options)

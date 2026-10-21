@@ -13,10 +13,8 @@ WORKDIR /app
 
 RUN python -c "import urllib.request; urllib.request.urlretrieve('https://github.com/ocsjs/ocsjs/releases/download/${OCS_SCRIPT_VERSION}/ocs.user.js', '/app/ocs.user.js')"
 
-RUN python -c "from pathlib import Path; p=Path('/app/ocs.user.js'); s=p.read_text(encoding='utf-8'); line='// @connect      ocs-llm-answer'; p.write_text(s if line in s else s.replace('// ==/UserScript==', line + '\n// ==/UserScript==', 1), encoding='utf-8')"
-
 # 先只复制依赖描述，利用 Docker cache
-COPY pyproject.toml uv.lock ./
+COPY pyproject.toml uv.lock .python-version ./
 
 # 创建项目虚拟环境并安装锁定依赖
 RUN uv sync --frozen --no-dev --no-install-project

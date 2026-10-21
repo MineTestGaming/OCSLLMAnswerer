@@ -2,6 +2,8 @@ import json
 import unittest
 from types import SimpleNamespace
 
+from openai import APIConnectionError, APIStatusError, APITimeoutError, OpenAIError
+
 from model_router import ModelRouter, RoutingConfig, InvalidAnswer
 from jev_router import L0Result
 
@@ -124,11 +126,58 @@ class RoutingTests(unittest.TestCase):
         with self.assertRaises(InvalidAnswer):
             self.solve(A, B, "invalid")
 
-    def test_infrastructure_errors_do_not_trigger_extra_paid_calls(self):
-        client = FakeClient(TimeoutError("timeout"), A)
-        with self.assertRaises(TimeoutError):
+    def test_provider_failures_in_either_l1_stage_escalate(self):
+        request = SimpleNamespace()
+        response = SimpleNamespace(request=request, status_code=503, headers={})
+        failures = (
+            TimeoutError("private-timeout-detail"),
+            ConnectionError("private-connection-detail"),
+            APITimeoutError(request),
+            APIConnectionError(request=request),
+            APIStatusError("private-provider-detail", response=response, body=None),
+            OpenAIError("private-sdk-detail"),
+        )
+        for prefix, reason in (((), "l1_call_failed"), ((A,), "verifier_call_failed")):
+            for failure in failures:
+                with self.subTest(stage=reason, error=type(failure).__name__):
+                    result, calls = self.solve(*prefix, failure, B)
+                    self.assertEqual(result["answer"], B["answer"])
+                    self.assertEqual(result["analysis"], B["analysis"])
+                    self.assertEqual([c["model"] for c in calls],
+                                     ["cheap"] * (len(prefix) + 1) + ["strong"])
+                    self.assertTrue(all(c["messages"] == MESSAGES for c in calls))
+                    self.assertEqual(result["_meta"]["route"], "escalated_l2")
+                    self.assertTrue(result["_meta"]["upgraded"])
+                    self.assertIn(reason, result["_meta"]["reasons"])
+                    self.assertEqual(result["_meta"]["attempts"][-2], {
+                        "model": "cheap", "status": "failed",
+                        "error_type": type(failure).__name__,
+                    })
+                    self.assertNotIn("private-", json.dumps(result))
+
+    def test_l2_failure_after_l1_failure_propagates_without_more_calls(self):
+        failure = TimeoutError("strong model unavailable")
+        client = FakeClient(ConnectionError("cheap model unavailable"), failure)
+        with self.assertRaises(TimeoutError) as raised:
             ModelRouter(client, RoutingConfig("cheap", "strong")).solve(MESSAGES, "题目", "single")
-        self.assertEqual(len(client.calls), 1)
+        self.assertIs(raised.exception, failure)
+        self.assertEqual([c["model"] for c in client.calls], ["cheap", "strong"])
+
+    def test_direct_l2_failure_does_not_call_l1(self):
+        failure = TimeoutError("strong model unavailable")
+        client = FakeClient(failure)
+        with self.assertRaises(TimeoutError) as raised:
+            ModelRouter(client, RoutingConfig("cheap", "strong")).solve(
+                MESSAGES, "以下不正确的是", "single",
+            )
+        self.assertIs(raised.exception, failure)
+        self.assertEqual([c["model"] for c in client.calls], ["strong"])
+
+    def test_programming_errors_are_not_treated_as_provider_failures(self):
+        client = FakeClient(TypeError("incorrect client usage"), B)
+        with self.assertRaises(TypeError):
+            ModelRouter(client, RoutingConfig("cheap", "strong")).solve(MESSAGES, "题目", "single")
+        self.assertEqual([c["model"] for c in client.calls], ["cheap"])
 
     def test_legacy_think_and_fence_wrapping_is_supported(self):
         wrapped = '<think>内部文本</think>\n```json\n{"answer":"A","analysis":"解析"}\n```'

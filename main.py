@@ -17,10 +17,141 @@ from jev_router import JevRouter
 from model_router import InvalidAnswer, ModelRouter, RoutingConfig
 
 
-def patch_connect():
+# One Jev retry budget, two Terra calls, two Astra calls, and transport margin.
+# OpenAI SDK network retries are separate from these model-call budgets.
+DEFAULT_OCS_ANSWER_TIMEOUT_SECONDS = 30 + 2 * 600 + 2 * 600 + 60
+OCS_ANSWER_RETRY_COUNT = 10
+OCS_ANSWER_RETRY_INTERVAL_SECONDS = 30
+# The worker timer covers every attempt, retry interval, and a ten-second grace.
+MAX_OCS_ANSWER_TIMEOUT_SECONDS = (
+    2_147_483 - OCS_ANSWER_RETRY_COUNT * OCS_ANSWER_RETRY_INTERVAL_SECONDS - 10
+) // (OCS_ANSWER_RETRY_COUNT + 1)
+
+
+def patch_answer_timeout(text, timeout_seconds):
+    """Keep all OCS answer timers above the model pipeline's time budget."""
+    def replace_once(pattern, replacement, label):
+        nonlocal text
+        text, count = re.subn(pattern, replacement, text, flags=re.DOTALL)
+        if count != 1:
+            raise ValueError(f"OCS 超时补丁无法定位 {label}，请检查脚本版本")
+
+    # OCS restores browser settings at startup and whenever the setting changes.
+    # Clamp those assignments too, so an old 120-second setting cannot undo this.
+    config = f"""const AnswerWrapperHandlerConfig = {{
+    retry_count: {OCS_ANSWER_RETRY_COUNT},
+    retry_interval_seconds: {OCS_ANSWER_RETRY_INTERVAL_SECONDS},
+    _timeout_seconds: {timeout_seconds},
+    get timeout_seconds() {{
+      return this._timeout_seconds;
+    }},
+    set timeout_seconds(value) {{
+      const seconds = Number(value);
+      this._timeout_seconds = Number.isFinite(seconds)
+        ? Math.min({MAX_OCS_ANSWER_TIMEOUT_SECONDS}, Math.max({timeout_seconds}, seconds)) : {timeout_seconds};
+    }},
+    get total_timeout_seconds() {{
+      return this.timeout_seconds * (this.retry_count + 1)
+        + this.retry_count * this.retry_interval_seconds;
+    }}
+  }};"""
+    replace_once(
+        r"const AnswerWrapperHandlerConfig\s*=\s*\{.*?\n  \};",
+        lambda match: config,
+        "AnswerWrapperHandlerConfig",
+    )
+    # Also replace the fixed 60-second timer used by older OCS releases.
+    replace_once(
+        r'(reject\(new Error\([\"\']答题超时！[\"\']\)\);\s*\},\s*)[^\n]+?(?=\);)',
+        lambda match: match[1] + "(AnswerWrapperHandlerConfig.total_timeout_seconds + 10) * 1e3",
+        "答题等待计时器",
+    )
+
+    def patch_setting(match):
+        setting = match[0]
+        for name, value in (
+            ("min", timeout_seconds),
+            ("max", max(9999, timeout_seconds)),
+            ("defaultValue", timeout_seconds),
+        ):
+            setting, count = re.subn(rf"\b{name}:\s*[^,\n]+", f"{name}: {value}", setting)
+            if count != 1:
+                raise ValueError(f"OCS 超时补丁无法定位搜题设置的 {name}")
+        return setting
+
+    replace_once(
+        r"\banswerWrapperHandlerTimeout:\s*\{.*?\n {10}\},",
+        patch_setting,
+        "搜题最大耗时设置",
+    )
+    return text
+
+
+def patch_answer_retry(text):
+    """Retry only question-bank requests, leaving response handlers outside it."""
+    helper = Path(__file__).with_name("userscript_retry.js").read_text(encoding="utf-8").rstrip()
+    # Replace our previous helper too, so restarting never stacks retry loops.
+    helper_pattern = r"  // OCS answer retry patch begin\n.*?  // OCS answer retry patch end\n"
+    text, count = re.subn(helper_pattern, "", text, flags=re.DOTALL)
+    if count > 1:
+        raise ValueError("OCS 重试补丁存在重复标记，请检查脚本版本")
+    marker = "  async function defaultAnswerWrapperHandler(answererWrappers, env) {"
+    if text.count(marker) != 1:
+        raise ValueError("OCS 重试补丁无法定位题库处理器，请检查脚本版本")
+    text = text.replace(marker, helper + "\n" + marker, 1)
+
+    # Replace the original per-request race and its timeout check as one unit.
+    pattern = (
+        r"const responseData = await Promise\.race\(\[\s*"
+        r"request\(url\.toString\(\), (\{.*?\})\),\s*"
+        r"\$\.sleep\([^\n]+\)\s*\]\);\s*"
+        r"if \(responseData === void 0\) \{\s*throw new Error\([^\n]+\);\s*\}"
+    )
+    text, count = re.subn(
+        pattern,
+        lambda match: "const responseData = await requestAnswerWrapperWithRetry(url.toString(), " + match[1] + ");",
+        text, flags=re.DOTALL,
+    )
+    if count != 1 and not (count == 0 and text.count(
+        "const responseData = await requestAnswerWrapperWithRetry(url.toString(), "
+    ) == 1):
+        raise ValueError("OCS 重试补丁无法定位题库请求，请检查脚本版本")
+
+    # OCS's fetch branch otherwise treats HTTP 502 JSON as a successful request.
+    # The extra check is enabled only by the question-bank retry helper.
+    http_check = """// OCS answer HTTP status patch begin
+            if (opts && opts.ocsQuestionBankRequest && !response.ok) {
+              reject(new Error(`题库请求失败（HTTP ${response.status}）`));
+              return;
+            }
+            // OCS answer HTTP status patch end
+            """
+    text, count = re.subn(
+        r"// OCS answer HTTP status patch begin\n.*?// OCS answer HTTP status patch end\n\s*",
+        "", text, flags=re.DOTALL,
+    )
+    if count > 1:
+        raise ValueError("OCS HTTP 状态补丁存在重复标记，请检查脚本版本")
+    text, count = re.subn(
+        r"(fet\(url, [^\n]+\)\.then\(\(response\) => \{\n\s*)",
+        lambda match: match[1] + http_check,
+        text,
+    )
+    if count != 1:
+        raise ValueError("OCS 重试补丁无法定位 fetch 请求，请检查脚本版本")
+    return text
+
+
+def patch_connect(path=Path("/app/ocs.user.js"), env=None):
+    env = os.environ if env is None else env
+    timeout_seconds = int(env.get("OCS_ANSWER_TIMEOUT_SECONDS", DEFAULT_OCS_ANSWER_TIMEOUT_SECONDS))
+    if not 1 <= timeout_seconds <= MAX_OCS_ANSWER_TIMEOUT_SECONDS:
+        raise ValueError(
+            f"OCS_ANSWER_TIMEOUT_SECONDS 必须为 1 到 {MAX_OCS_ANSWER_TIMEOUT_SECONDS} 的整数秒"
+        )
     ip = socket.gethostbyname(socket.gethostname())
 
-    path = Path("/app/ocs.user.js")
+    path = Path(path)
     text = path.read_text(encoding="utf-8")
 
     # 清理旧的动态 @connect
@@ -31,15 +162,29 @@ def patch_connect():
     ]
 
     marker = "// ==/UserScript=="
-    connect = f"// @connect      {ip}"
-
     text = "\n".join(lines)
 
-    if connect not in text:
-        text = text.replace(marker, f"{connect}\n{marker}", 1)
+    if marker not in text:
+        raise ValueError("OCS 脚本缺少 UserScript 元数据结束标记")
+    for host in ("ocs-llm-answer", ip):
+        if not re.search(rf"^//\s*@connect\s+{re.escape(host)}\s*$", text, re.MULTILINE):
+            text = text.replace(marker, f"// @connect      {host}\n{marker}", 1)
+
+    text = patch_answer_timeout(text, timeout_seconds)
+    text = patch_answer_retry(text)
 
     path.write_text(text, encoding="utf-8")
-    print(f"Patched userscript @connect -> {ip}", flush=True)
+    worker_timeout = (
+        timeout_seconds * (OCS_ANSWER_RETRY_COUNT + 1)
+        + OCS_ANSWER_RETRY_COUNT * OCS_ANSWER_RETRY_INTERVAL_SECONDS + 10
+    )
+    print(
+        f"Patched userscript @connect -> ocs-llm-answer, {ip}; "
+        f"answer timeout >= {timeout_seconds}s per attempt; "
+        f"retry {OCS_ANSWER_RETRY_COUNT} times every {OCS_ANSWER_RETRY_INTERVAL_SECONDS}s; "
+        f"worker timeout >= {worker_timeout}s",
+        flush=True,
+    )
 
 
 # 初始化 colorama
@@ -122,7 +267,7 @@ def build_question_messages(
     elif original_type == "multiple":
         special_instruction = "重要提示：这是一道【多选题】，本题为多选题。请逐项判断每个选项是否正确，选择所有符合题意的正确选项，不得遗漏正确选项，也不得加入错误选项。正确答案数量可能为两个或更多，不要默认固定数量，answer 字段中必须填写所有正确选项的完整内容，并严格按照原选项顺序排列，用 '#' 号分隔（例如：A#C#D）。"
     elif original_type == "completion":
-        special_instruction = "重要提示：这是一道【填空题】，请根据题干语义、知识点和上下文，填写最准确、最规范且能够直接代入题目空缺位置的答案。优先使用教材中的标准术语、固定表达、公式、数值或名称，避免不必要的解释和同义改写，不要直接输出填空编号等系统提示，除非题目有要求。"
+        special_instruction = "重要提示：这是一道【填空题】，请根据题干语义、知识点和上下文，填写最准确、最规范且能够直接代入题目空缺位置的答案。优先使用教材中的标准术语、固定表达、公式、数值或名称，避免不必要的解释和同义改写，不要直接输出填空编号等系统提示，除非题目有要求。如果题目为分点的计算题，那么请把过程也写上"
         options = ""
     elif original_type == "judgement":
         special_instruction = "重要提示：这是一道【判断题】，请判断题干陈述整体是否正确，并从题目提供的判断选项中选择对应答案。判断时应特别注意绝对化表述、适用条件、概念范围、因果关系以及例外情况。answer 字段中只填写对应选项的完整内容，例如“正确”或“错误”，不得添加任何其他内容。"
@@ -139,7 +284,7 @@ def build_question_messages(
         )
     if image_options:
         special_instruction = special_instruction.replace(
-            "正确选项的完整内容", "正确选项的大写字母"
+            "正确选项的完整内容", "正确选项的大写字母，而非选项的数字编号，若没有提供字母编号，请回复ABCD...顺序的字母或者选项的完整内容"
         )
         special_instruction = special_instruction.replace(
             "对应选项的完整内容，例如“正确”或“错误”", "对应选项的大写字母"

@@ -63,14 +63,30 @@ class ServerTests(unittest.TestCase):
             "analysis": "Jev L0 高置信度直答（99.0%+）",
         })
 
+    def test_search_returns_l2_answer_after_either_l1_stage_fails(self):
+        for prefix in ((), (A,)):
+            with self.subTest(verifier=bool(prefix)):
+                client = FakeClient(*prefix, TimeoutError("private-provider-detail"), B)
+                with patch.object(main, "client", client):
+                    response = main.app.test_client().post("/search", json={
+                        "title": "题目", "type": "single",
+                    })
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json, {"code": 1, "question": "题目", **B})
+                self.assertEqual([c["model"] for c in client.calls],
+                                 ["cheap"] * (len(prefix) + 1) + ["strong"])
+
     def test_provider_failure_is_not_reported_as_success(self):
-        with patch.object(main, "client", FakeClient(TimeoutError("private-provider-detail"))):
+        client = FakeClient(TimeoutError("private-l1-detail"),
+                            TimeoutError("private-provider-detail"))
+        with patch.object(main, "client", client):
             response = main.app.test_client().post("/search", json={"title": "题目", "type": "single"})
         self.assertEqual(response.status_code, 502)
         self.assertEqual(response.json["code"], 0)
         self.assertNotIn("private-provider-detail", response.get_data(as_text=True))
         self.assertIsNone(response.json["raw_output"])
         self.assertEqual(response.json["error_type"], "TimeoutError")
+        self.assertEqual([c["model"] for c in client.calls], ["cheap", "strong"])
 
     def test_502_returns_final_model_output_before_any_cleanup(self):
         raw = '  <think>原始思考</think>\n```json\n{"answer":"A"}\n```  '
