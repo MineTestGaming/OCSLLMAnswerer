@@ -6,6 +6,7 @@ from openai import APIConnectionError, APIStatusError, APITimeoutError, OpenAIEr
 
 from model_router import ModelRouter, RoutingConfig, InvalidAnswer
 from jev_router import L0Result
+from image_input import ImageReference
 
 
 class FakeClient:
@@ -33,6 +34,12 @@ A = {"answer": "A", "analysis": "原解析"}
 B = {"answer": "B", "analysis": "复核后的解析"}
 
 
+def provider_error(status, message, param=None):
+    response = SimpleNamespace(request=SimpleNamespace(), status_code=status, headers={})
+    return APIStatusError("private-provider-detail", response=response,
+                          body={"error": {"message": message, "param": param}})
+
+
 class FakeJevRouter:
     def __init__(self, result):
         self.result = result
@@ -41,6 +48,83 @@ class FakeJevRouter:
     def solve(self, title, options, question_type):
         self.calls.append((title, options, question_type))
         return self.result
+
+
+class BackupRoutingTests(unittest.TestCase):
+    def test_final_primary_failure_uses_separate_backup_client(self):
+        for title, responses in (
+            ("普通题", (ConnectionError("l1 down"), TimeoutError("l2 down"))),
+            ("以下不正确的是", (TimeoutError("l2 down"),)),
+            ("普通题", (A, B, "invalid JSON")),
+        ):
+            with self.subTest(title=title, responses=responses):
+                primary = FakeClient(*responses)
+                backup = FakeClient(B)
+                config = RoutingConfig("cheap", "strong", backup_model="backup")
+                result = ModelRouter(primary, config, backup_client=backup).solve(
+                    MESSAGES, title, "single",
+                )
+                self.assertEqual(result["answer"], B["answer"])
+                self.assertEqual(result["_meta"]["route"], "backup")
+                self.assertEqual(result["_meta"]["model"], "backup")
+                self.assertIn("primary_l2_failed", result["_meta"]["reasons"])
+                self.assertEqual(len(backup.calls), 1)
+                self.assertEqual(backup.calls[0]["model"], "backup")
+                self.assertEqual(backup.calls[0]["messages"], MESSAGES)
+
+    def test_healthy_primary_does_not_call_backup(self):
+        backup = FakeClient()
+        config = RoutingConfig("cheap", "strong", backup_model="backup")
+        result = ModelRouter(FakeClient(A, A), config, backup_client=backup).solve(
+            MESSAGES, "普通题", "single",
+        )
+        self.assertEqual(result["_meta"]["route"], "verified_l1")
+        self.assertEqual(backup.calls, [])
+
+    def test_failed_backup_does_not_loop_or_accept_invalid_answer(self):
+        for failure in (TimeoutError("backup down"), "invalid JSON"):
+            with self.subTest(failure=failure):
+                backup = FakeClient(failure)
+                config = RoutingConfig("cheap", "strong", backup_model="backup")
+                with self.assertRaises((TimeoutError, InvalidAnswer)):
+                    ModelRouter(FakeClient(TimeoutError()), config, backup_client=backup).solve(
+                        MESSAGES, "以下不正确的是", "single",
+                    )
+                self.assertEqual(len(backup.calls), 1)
+
+    def test_backup_settings_are_read_from_environment(self):
+        config = RoutingConfig.from_env({
+            "OPENAI_BACKUP_MODEL": " backup ",
+            "OPENAI_BACKUP_VISION_MODELS": " backup, other ",
+        })
+        self.assertEqual(config.backup_model, "backup")
+        self.assertEqual(config.backup_vision_models, frozenset({"backup", "other"}))
+
+    def test_backup_uses_its_own_vision_capabilities(self):
+        for supports_vision in (False, True):
+            with self.subTest(supports_vision=supports_vision):
+                backup = FakeClient(A)
+                config = RoutingConfig(
+                    "cheap", "shared", vision_models=frozenset({"shared"}),
+                    backup_model="shared",
+                    backup_vision_models=frozenset({"shared"}) if supports_vision else frozenset(),
+                )
+                ModelRouter(FakeClient(TimeoutError()), config, backup_client=backup).solve(
+                    MESSAGES, "以下不正确的是", "single",
+                    images={"[Image 1]": ImageReference("https://example.com/a.png",
+                                                      "data:image/png;base64,AA==")},
+                )
+                content = backup.calls[0]["messages"][-1]["content"]
+                self.assertEqual(isinstance(content, list), supports_vision)
+
+    def test_jev_direct_l2_failure_also_uses_backup(self):
+        jev = FakeJevRouter(L0Result("A", "direct_l2", 0.5, 1.0, "jev-test", 0.99))
+        config = RoutingConfig("cheap", "strong", backup_model="backup")
+        result = ModelRouter(FakeClient(TimeoutError()), config,
+                             jev_router=jev, backup_client=FakeClient(B)).solve(
+            MESSAGES, "普通题", "single", options="A. 甲\nB. 乙",
+        )
+        self.assertEqual(result["_meta"]["route"], "backup")
 
 
 class RoutingTests(unittest.TestCase):
@@ -57,6 +141,41 @@ class RoutingTests(unittest.TestCase):
         self.assertEqual(result["analysis"], "原解析")
         self.assertEqual([c["model"] for c in calls], ["cheap", "cheap"])
         self.assertFalse(result["_meta"]["upgraded"])
+
+    def test_explicit_temperature_rejection_retries_without_temperature(self):
+        failure = provider_error(400, "UnsupportedParamsError: model doesn't support temperature=0.3 while reasoning is active")
+        client = FakeClient(failure, B)
+        result = ModelRouter(client, RoutingConfig("cheap", "strong")).solve(
+            MESSAGES, "以下不正确的是", "single",
+        )
+        self.assertEqual(result["answer"], "B")
+        self.assertEqual([c["model"] for c in client.calls], ["strong", "strong"])
+        self.assertEqual(client.calls[0]["temperature"], 0.3)
+        self.assertNotIn("temperature", client.calls[1])
+        self.assertEqual([a["status"] for a in result["_meta"]["attempts"]], ["failed", "valid"])
+
+    def test_unrelated_errors_do_not_trigger_parameter_retry(self):
+        for failure in (provider_error(400, "response_format is unsupported", "response_format"),
+                        provider_error(401, "temperature unsupported")):
+            with self.subTest(failure=failure):
+                client = FakeClient(failure)
+                with self.assertRaises(APIStatusError):
+                    ModelRouter(client, RoutingConfig("cheap", "strong")).solve(
+                        MESSAGES, "以下不正确的是", "single",
+                    )
+                self.assertEqual(len(client.calls), 1)
+
+    def test_parameter_retry_is_bounded_before_backup(self):
+        failure = provider_error(400, "Unsupported parameter: temperature")
+        client = FakeClient(failure, failure)
+        backup = FakeClient(B)
+        config = RoutingConfig("cheap", "strong", backup_model="backup")
+        result = ModelRouter(client, config, backup_client=backup).solve(
+            MESSAGES, "以下不正确的是", "single",
+        )
+        self.assertEqual(result["_meta"]["route"], "backup")
+        self.assertEqual(len(client.calls), 2)
+        self.assertEqual(len(backup.calls), 1)
 
     def test_disagreement_uses_strong_model_without_rewriting_payload(self):
         final = {"answer": "  B#D  ", "analysis": "保留原始输出"}
@@ -149,7 +268,8 @@ class RoutingTests(unittest.TestCase):
                     self.assertEqual(result["_meta"]["route"], "escalated_l2")
                     self.assertTrue(result["_meta"]["upgraded"])
                     self.assertIn(reason, result["_meta"]["reasons"])
-                    self.assertEqual(result["_meta"]["attempts"][-2], {
+                    attempt = result["_meta"]["attempts"][-2]
+                    self.assertEqual({key: attempt[key] for key in ("model", "status", "error_type")}, {
                         "model": "cheap", "status": "failed",
                         "error_type": type(failure).__name__,
                     })

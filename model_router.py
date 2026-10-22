@@ -5,12 +5,56 @@ import os
 import re
 from dataclasses import dataclass
 
-from openai import OpenAIError
+from openai import APIConnectionError, APIStatusError, APITimeoutError, OpenAIError
 
 from image_input import attach_images
 
 
 MODEL_CALL_ERRORS = (OpenAIError, TimeoutError, ConnectionError)
+
+
+def rejects_temperature(exc):
+    """Retry only an explicit 400 temperature compatibility rejection."""
+    if not isinstance(exc, APIStatusError) or exc.status_code != 400:
+        return False
+    body = exc.body
+    if isinstance(body, dict):
+        error = body.get("error", body)
+    else:
+        error = body
+    if isinstance(error, dict):
+        if error.get("param") not in (None, "temperature"):
+            return False
+        message = str(error.get("message", "")).lower()
+    else:
+        message = str(error or "").lower()
+    return "temperature" in message and any(term in message for term in (
+        "unsupportedparams", "unsupported parameter", "unsupported value",
+        "doesn't support", "does not support", "not supported",
+    ))
+
+
+def model_error_details(exc):
+    """Describe the failure without exposing arbitrary provider exception text."""
+    status = getattr(exc, "status_code", None)
+    if rejects_temperature(exc):
+        reason = "接口不支持当前 temperature 参数（HTTP 400）"
+    elif isinstance(status, int):
+        reason = {
+            400: "接口拒绝请求参数", 401: "API Key 无效或无权访问",
+            402: "账户余额不足", 403: "接口拒绝访问",
+            404: "模型或接口地址不存在", 429: "请求限流或额度不足",
+        }.get(status, "上游模型接口异常") + f"（HTTP {status}）"
+    elif isinstance(exc, (APITimeoutError, TimeoutError)):
+        reason = "模型请求超时"
+    elif isinstance(exc, (APIConnectionError, ConnectionError)):
+        reason = "无法连接模型接口"
+    else:
+        reason = "模型调用失败，未取得有效输出"
+    details = {"error_type": type(exc).__name__, "reason": reason}
+    if isinstance(status, int):
+        details["http_status"] = status
+    return details
 
 
 class InvalidAnswer(ValueError):
@@ -26,6 +70,8 @@ class RoutingConfig:
     l1_model: str
     l2_model: str
     vision_models: frozenset[str] = frozenset()
+    backup_model: str = ""
+    backup_vision_models: frozenset[str] = frozenset()
 
     @classmethod
     def from_env(cls, env=None):
@@ -36,7 +82,11 @@ class RoutingConfig:
         # No assumed provider model names: existing deployments remain usable.
         vision = frozenset(name.strip() for name in
                            env.get("OPENAI_VISION_MODELS", "").split(",") if name.strip())
-        return cls(l1, env.get("OPENAI_MODEL_L2") or main, vision)
+        backup_vision = frozenset(name.strip() for name in
+                                 env.get("OPENAI_BACKUP_VISION_MODELS", "").split(",")
+                                 if name.strip())
+        return cls(l1, env.get("OPENAI_MODEL_L2") or main, vision,
+                   env.get("OPENAI_BACKUP_MODEL", "").strip(), backup_vision)
 
 
 def static_risk(title, question_type, options=""):
@@ -126,39 +176,64 @@ def multiple_answer_set(answer, options):
 
 
 class ModelRouter:
-    def __init__(self, client, config, jev_router=None):
+    def __init__(self, client, config, jev_router=None, backup_client=None):
         self.client = client
         self.config = config
         self.jev_router = jev_router
+        self.backup_client = backup_client
 
     def solve(self, messages, title, question_type, options="", images=None, image_options=False):
         attempts = []
         reasons = static_risk(title, question_type, options)
 
-        def call(model):
-            attempt = {"model": model, "status": "started"}
-            attempts.append(attempt)
+        def record_failure(exc, model, attempt):
+            exc.diagnostics = {
+                **getattr(exc, "diagnostics", {}),
+                "model": model,
+                "provider": attempt["provider"],
+                "reason": attempt["reason"],
+                "attempts": attempts,
+                "reasons": reasons,
+            }
+            if "http_status" in attempt:
+                exc.diagnostics["http_status"] = attempt["http_status"]
+
+        def call(model, *, backup=False):
+            active_client = self.backup_client if backup else self.client
+            vision_models = (self.config.backup_vision_models if backup
+                             else self.config.vision_models)
             # Each stage chooses its own input modality. Text-only models see
             # the same Image IDs, without image_url parts or OCR.
             call_messages = (attach_images(messages, images)
-                             if images and model in self.config.vision_models else messages)
-            if images and model not in self.config.vision_models:
+                             if images and model in vision_models else messages)
+            if images and model not in vision_models:
                 call_messages = [*messages[:-1], {
                     **messages[-1], "content": messages[-1]["content"] +
                     "\n本次未附图片，Image ID 仅为占位符。请依据剩余文字与知识尝试作答，"
                     "不要假称看到了图片或编造图中细节；analysis 简要说明缺少图片导致的不确定性。"
                     "仍须遵守上述 answer 格式和 JSON 要求。",
                 }]
-            try:
-                response = self.client.chat.completions.create(
-                    model=model,
-                    messages=call_messages,
-                    temperature=0.3,
-                    response_format={"type": "json_object"},
-                )
-            except MODEL_CALL_ERRORS as exc:
-                attempt.update(status="failed", error_type=type(exc).__name__)
-                raise
+            for omit_temperature in (False, True):
+                attempt = {"model": model, "status": "started",
+                           "provider": "backup" if backup else "primary"}
+                attempts.append(attempt)
+                kwargs = {"model": model, "messages": call_messages,
+                          "response_format": {"type": "json_object"}}
+                if omit_temperature:
+                    attempt["temperature_omitted"] = True
+                else:
+                    kwargs["temperature"] = 0.3
+                try:
+                    response = active_client.chat.completions.create(**kwargs)
+                except Exception as exc:
+                    attempt.update(status="failed", **model_error_details(exc))
+                    record_failure(exc, model, attempt)
+                    if not omit_temperature and rejects_temperature(exc):
+                        if "unsupported_temperature" not in reasons:
+                            reasons.append("unsupported_temperature")
+                        continue
+                    raise
+                break
             try:
                 if not response.choices:
                     raise InvalidAnswer("模型未返回候选答案")
@@ -175,7 +250,7 @@ class ModelRouter:
                 if question_type == "multiple":
                     multiple_answer_set(result["answer"], options)
             except InvalidAnswer as exc:
-                attempt["status"] = "invalid"
+                attempt.update(status="invalid", error_type=type(exc).__name__, reason=str(exc))
                 choice = response.choices[0] if response.choices else None
                 message = getattr(choice, "message", None)
                 # Preserve the original output, including whitespace, fences,
@@ -186,6 +261,7 @@ class ModelRouter:
                     "finish_reason": getattr(choice, "finish_reason", None),
                     "refusal": getattr(message, "refusal", None),
                 }
+                record_failure(exc, model, attempt)
                 raise
             attempt.update(status="valid", answer=result["answer"])
             return result
@@ -202,8 +278,19 @@ class ModelRouter:
                 "confidence_method": confidence_method,
             }}
 
+        def finish_l2(route):
+            try:
+                result = call(self.config.l2_model)
+            except (*MODEL_CALL_ERRORS, InvalidAnswer):
+                if self.backup_client is None or not self.config.backup_model:
+                    raise
+                reasons.append("primary_l2_failed")
+                return finish(call(self.config.backup_model, backup=True),
+                              self.config.backup_model, "backup")
+            return finish(result, self.config.l2_model, route)
+
         if reasons:
-            return finish(call(self.config.l2_model), self.config.l2_model, "direct_l2")
+            return finish_l2("direct_l2")
 
         if (self.jev_router is not None and not images and not image_options
                 and question_type in ("single", "judgement")):
@@ -218,9 +305,7 @@ class ModelRouter:
                 })
                 if l0.route == "direct_l2":
                     reasons.append("jev_direct_l2")
-                    return finish(
-                        call(self.config.l2_model), self.config.l2_model, "direct_l2"
-                    )
+                    return finish_l2("direct_l2")
                 if l0.can_answer_directly:
                     reasons.append("jev_high_confidence")
                     return finish(
@@ -262,4 +347,4 @@ class ModelRouter:
 
         if self.config.l1_model == self.config.l2_model:
             reasons.append("same_model_fallback")
-        return finish(call(self.config.l2_model), self.config.l2_model, "escalated_l2")
+        return finish_l2("escalated_l2")

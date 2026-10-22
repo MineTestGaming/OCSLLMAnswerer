@@ -6,7 +6,7 @@ from unittest.mock import patch
 from types import SimpleNamespace
 import ssl
 
-from test_routing import A, B, FakeClient
+from test_routing import A, B, FakeClient, provider_error
 from jev_router import L0Result
 from test_routing import FakeJevRouter
 
@@ -23,6 +23,36 @@ class ServerTests(unittest.TestCase):
         }, clear=True)
         self.env.start()
         self.addCleanup(self.env.stop)
+
+    def test_backup_client_uses_independent_credentials_and_timeout(self):
+        with patch.object(main, "OpenAI") as factory:
+            main.create_backup_client({
+                "OPENAI_BACKUP_API_KEY": "backup-key",
+                "OPENAI_BACKUP_BASE_URL": "https://backup.example/v1",
+                "OPENAI_BACKUP_MODEL": "backup-model",
+                "OPENAI_TIMEOUT_SECONDS": "30",
+            })
+        factory.assert_called_once_with(api_key="backup-key",
+                                        base_url="https://backup.example/v1", timeout=30.0)
+        self.assertIsNone(main.create_backup_client({}))
+        with self.assertRaisesRegex(ValueError, "OPENAI_BACKUP_BASE_URL"):
+            main.create_backup_client({"OPENAI_BACKUP_MODEL": "backup-model"})
+
+    def test_search_uses_backup_after_primary_failure(self):
+        for backup_result, expected_status in ((B, 200), ("invalid JSON", 502)):
+            with self.subTest(backup_result=backup_result), \
+                    patch.dict(os.environ, {"OPENAI_BACKUP_MODEL": "backup"}), \
+                    patch.object(main, "client", FakeClient(TimeoutError())), \
+                    patch.object(main, "backup_client", FakeClient(backup_result)):
+                response = main.app.test_client().post("/search", json={
+                    "title": "以下不正确的是", "type": "single",
+                })
+            self.assertEqual(response.status_code, expected_status)
+            self.assertEqual(response.json["code"], int(expected_status == 200))
+            if expected_status == 200:
+                self.assertEqual(response.json["answer"], B["answer"])
+            else:
+                self.assertEqual(response.json["model"], "backup")
 
     def test_original_messages_are_preserved_for_every_type_and_stage(self):
         fixtures = json.loads(Path(__file__).with_name("original_messages.json").read_text(encoding="utf-8"))
@@ -87,6 +117,30 @@ class ServerTests(unittest.TestCase):
         self.assertIsNone(response.json["raw_output"])
         self.assertEqual(response.json["error_type"], "TimeoutError")
         self.assertEqual([c["model"] for c in client.calls], ["cheap", "strong"])
+        self.assertEqual(response.json["model"], "strong")
+        self.assertEqual([a["model"] for a in response.json["attempts"]], ["cheap", "strong"])
+
+    def test_failure_reports_jev_primary_and_backup_attempts_without_secrets(self):
+        jev = FakeJevRouter(L0Result("A", "verify_l1", 0.5, 1.0, "jev-test", 0.99))
+        with patch.dict(os.environ, {"OPENAI_BACKUP_MODEL": "backup"}), \
+                patch.object(main, "jev_router", jev), \
+                patch.object(main, "client", FakeClient(TimeoutError(), TimeoutError())), \
+                patch.object(main, "backup_client", FakeClient(provider_error(402, "private-secret"))), \
+                patch.object(main, "log_error") as log:
+            response = main.app.test_client().post("/search", json={
+                "title": "普通题", "options": "A. 甲\nB. 乙", "type": "single",
+            })
+        self.assertEqual(response.status_code, 502)
+        data = response.json
+        self.assertEqual([a["model"] for a in data["attempts"]],
+                         ["jev-test", "cheap", "strong", "backup"])
+        self.assertEqual(data["http_status"], 402)
+        self.assertEqual(data["provider"], "backup")
+        self.assertIn("余额不足", data["reason"])
+        logged = " ".join(str(call) for call in log.call_args_list)
+        for model in ("jev-test", "cheap", "strong", "backup"):
+            self.assertIn(model, logged)
+        self.assertNotIn("private-", logged + response.get_data(as_text=True))
 
     def test_502_returns_final_model_output_before_any_cleanup(self):
         raw = '  <think>原始思考</think>\n```json\n{"answer":"A"}\n```  '
@@ -100,6 +154,7 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(response.json["model"], "strong")
         self.assertEqual(response.json["finish_reason"], "stop")
         self.assertEqual(response.json["reason"], "模型输出必须且只能包含 answer 和 analysis")
+        self.assertEqual([a["model"] for a in response.json["attempts"]], ["cheap", "strong"])
 
     def test_502_preserves_truncated_or_refused_output(self):
         for content, finish, refusal in (("{\"answer\":", "length", None),
@@ -139,6 +194,21 @@ class ServerTests(unittest.TestCase):
     def test_ssl_disabled_by_default(self):
         self.assertIsNone(main.get_ssl_context({}))
         self.assertIsNone(main.get_ssl_context({"SSL_ENABLED": "false"}))
+
+    def test_missing_userscript_returns_404_and_server_remains_available(self):
+        with patch.object(main, "send_file", side_effect=FileNotFoundError()):
+            client = main.app.test_client()
+            response = client.get("/ocs.user.js")
+            self.assertEqual(response.status_code, 404)
+            self.assertEqual(response.json, {"code": 0, "msg": "OCS 脚本不存在"})
+            self.assertEqual(client.get("/").status_code, 200)
+
+    def test_missing_userscript_does_not_prevent_server_startup(self):
+        with patch.object(main, "get_ssl_context", return_value=None), \
+                patch.object(main.Path, "read_text", side_effect=FileNotFoundError()), \
+                patch.object(main, "log_info"), patch.object(main.app, "run") as run:
+            main.run_server()
+        run.assert_called_once()
 
     def test_ssl_loads_configured_certificate_and_key(self):
         with patch("ssl.SSLContext") as context_class:

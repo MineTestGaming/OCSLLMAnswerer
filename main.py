@@ -1,8 +1,11 @@
 import json
+import logging
 import os
 import re
 import socket
 import ssl
+import sys
+from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from datetime import datetime
 from pathlib import Path
 
@@ -15,6 +18,16 @@ from openai import OpenAI
 from image_input import ImageAccessError, label_image_options, prepare_images
 from jev_router import JevRouter
 from model_router import InvalidAnswer, ModelRouter, RoutingConfig
+
+
+def get_debug_flag(env=None):
+    env = os.environ if env is None else env
+    value = env.get("DEBUG", "false").strip().lower()
+    if value in ("1", "true", "yes", "on"):
+        return True
+    if value in ("", "0", "false", "no", "off"):
+        return False
+    raise ValueError("DEBUG 必须为 true/false、1/0、yes/no 或 on/off")
 
 
 # One Jev retry budget, two Terra calls, two Astra calls, and transport margin.
@@ -143,6 +156,13 @@ def patch_answer_retry(text):
 
 
 def patch_connect(path=Path("/app/ocs.user.js"), env=None):
+    path = Path(path)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        log_info(f"OCS 脚本不存在，跳过补丁: {path}")
+        return
+
     env = os.environ if env is None else env
     timeout_seconds = int(env.get("OCS_ANSWER_TIMEOUT_SECONDS", DEFAULT_OCS_ANSWER_TIMEOUT_SECONDS))
     if not 1 <= timeout_seconds <= MAX_OCS_ANSWER_TIMEOUT_SECONDS:
@@ -150,9 +170,6 @@ def patch_connect(path=Path("/app/ocs.user.js"), env=None):
             f"OCS_ANSWER_TIMEOUT_SECONDS 必须为 1 到 {MAX_OCS_ANSWER_TIMEOUT_SECONDS} 的整数秒"
         )
     ip = socket.gethostbyname(socket.gethostname())
-
-    path = Path(path)
-    text = path.read_text(encoding="utf-8")
 
     # 清理旧的动态 @connect
     lines = [
@@ -178,7 +195,7 @@ def patch_connect(path=Path("/app/ocs.user.js"), env=None):
         timeout_seconds * (OCS_ANSWER_RETRY_COUNT + 1)
         + OCS_ANSWER_RETRY_COUNT * OCS_ANSWER_RETRY_INTERVAL_SECONDS + 10
     )
-    print(
+    debug_print(
         f"Patched userscript @connect -> ocs-llm-answer, {ip}; "
         f"answer timeout >= {timeout_seconds}s per attempt; "
         f"retry {OCS_ANSWER_RETRY_COUNT} times every {OCS_ANSWER_RETRY_INTERVAL_SECONDS}s; "
@@ -192,6 +209,14 @@ init(autoreset=True)
 
 # 加载环境变量
 load_dotenv()
+DEBUG = get_debug_flag()
+CONSOLE_STREAM = sys.stdout
+
+
+def debug_print(*args, **kwargs):
+    if DEBUG:
+        kwargs.setdefault("flush", True)
+        print(*args, **kwargs)
 
 app = Flask(__name__)
 
@@ -202,43 +227,69 @@ api_key = os.getenv("OPENAI_API_KEY")
 base_url = os.getenv("OPENAI_BASE_URL")
 
 if not api_key:
-    print(Fore.RED + "Warning: OPENAI_API_KEY is not set in environment variables.")
+    debug_print(Fore.RED + "Warning: OPENAI_API_KEY is not set in environment variables.")
 
-client = OpenAI(api_key=api_key, base_url=base_url if base_url else None)
+client = OpenAI(api_key=api_key, base_url=base_url if base_url else None,
+                timeout=float(os.getenv("OPENAI_TIMEOUT_SECONDS", "600")))
+
+
+def create_backup_client(env=None):
+    env = os.environ if env is None else env
+    names = ("OPENAI_BACKUP_API_KEY", "OPENAI_BACKUP_BASE_URL", "OPENAI_BACKUP_MODEL")
+    values = {name: env.get(name, "").strip() for name in names}
+    if not any(values.values()):
+        return None
+    missing = [name for name, value in values.items() if not value]
+    if missing:
+        raise ValueError("备用模型配置不完整，缺少: " + ", ".join(missing))
+    return OpenAI(api_key=values["OPENAI_BACKUP_API_KEY"],
+                  base_url=values["OPENAI_BACKUP_BASE_URL"],
+                  timeout=float(env.get("OPENAI_TIMEOUT_SECONDS", "600")))
+
+
+backup_client = create_backup_client()
 jev_router = JevRouter.from_env()
 
 
 def log_info(msg):
-    print(
+    debug_print(
         f"{Fore.CYAN}[INFO] {datetime.now().strftime('%H:%M:%S')} {Style.RESET_ALL}{msg}"
     )
 
 
 def log_success(msg):
-    print(
+    debug_print(
         f"{Fore.GREEN}[SUCCESS] {datetime.now().strftime('%H:%M:%S')} {Style.RESET_ALL}{msg}"
     )
 
 
 def log_error(msg):
-    print(
+    debug_print(
         f"{Fore.RED}[ERROR] {datetime.now().strftime('%H:%M:%S')} {Style.RESET_ALL}{msg}"
     )
 
 
 def log_request(title, options, q_type):
-    print(
+    debug_print(
         f"\n{Fore.YELLOW}新的请求 [{datetime.now().strftime('%H:%M:%S')}] {Style.RESET_ALL}"
     )
-    print(f"{Fore.BLUE}题目:{Style.RESET_ALL} {title}")
-    print(f"{Fore.BLUE}类型:{Style.RESET_ALL} {q_type}")
+    debug_print(f"{Fore.BLUE}题目:{Style.RESET_ALL} {title}")
+    debug_print(f"{Fore.BLUE}类型:{Style.RESET_ALL} {q_type}")
     if options:
-        print(f"{Fore.BLUE}选项:{Style.RESET_ALL} \n{options.strip()}")
+        debug_print(f"{Fore.BLUE}选项:{Style.RESET_ALL} \n{options.strip()}")
 
 
 def log_response(answer, analysis):
-    print(f"{Fore.MAGENTA}答案:{Style.RESET_ALL} {answer}")
-    print(f"{Fore.MAGENTA}解析:{Style.RESET_ALL} {analysis}")
+    debug_print(f"{Fore.MAGENTA}答案:{Style.RESET_ALL} {answer}")
+    debug_print(f"{Fore.MAGENTA}解析:{Style.RESET_ALL} {analysis}")
+
+
+def log_model_calls(attempts):
+    if DEBUG:
+        return
+    for attempt in attempts:
+        result = "成功" if attempt.get("status") == "valid" else "失败"
+        print(f"{attempt['model']}: {result}", file=CONSOLE_STREAM, flush=True)
 
 
 # 题型映射
@@ -363,7 +414,8 @@ def get_chatgpt_answer(title, options, original_type, user_agent=None):
         image_options = labelled_options is not None
         if image_options:
             options = labelled_options
-        router = ModelRouter(client, RoutingConfig.from_env(), jev_router=jev_router)
+        router = ModelRouter(client, RoutingConfig.from_env(), jev_router=jev_router,
+                             backup_client=backup_client)
         result = router.solve(
             build_question_messages(
                 title, options, original_type, images, image_options
@@ -374,6 +426,7 @@ def get_chatgpt_answer(title, options, original_type, user_agent=None):
             images=images,
             image_options=image_options,
         )
+        log_model_calls(result["_meta"].get("attempts", []))
         log_info("模型路由: " + json.dumps(result["_meta"], ensure_ascii=False))
         if images:
             # OCS still matches the original option contents, not internal IDs.
@@ -390,11 +443,14 @@ def get_chatgpt_answer(title, options, original_type, user_agent=None):
     except ImageAccessError:
         raise
     except Exception as e:
+        diagnostics = getattr(e, "diagnostics", {})
+        log_model_calls(diagnostics.get("attempts", []))
         reason = (
-            str(e) if isinstance(e, InvalidAnswer) else "模型调用失败，未取得有效输出"
+            str(e) if isinstance(e, InvalidAnswer)
+            else diagnostics.get("reason", "模型调用失败，未取得有效输出")
         )
-        diagnostics = e.diagnostics if isinstance(e, InvalidAnswer) else {}
         log_error(f"OpenAI 调用或解析失败: {type(e).__name__}: {reason}")
+        log_error("模型调用记录: " + json.dumps(diagnostics.get("attempts", []), ensure_ascii=False))
         return {
             "answer": "未知",
             "analysis": "服务器处理出错",
@@ -472,6 +528,10 @@ def search_answer():
                     "refusal": meta.get("refusal"),
                     "error_type": meta.get("error_type"),
                     "reason": meta.get("reason"),
+                    "provider": meta.get("provider"),
+                    "http_status": meta.get("http_status"),
+                    "attempts": meta.get("attempts", []),
+                    "reasons": meta.get("reasons", []),
                 }
             ), 502
 
@@ -495,9 +555,8 @@ def get_plugin():
         return send_file(
             "/app/ocs.user.js", mimetype="application/javascript", as_attachment=False
         )
-    except Exception as e:
-        log_error(f"脚本不存在: {e}")
-        return jsonify({"code": 0, "msg": str(e)}), 404
+    except FileNotFoundError:
+        return jsonify({"code": 0, "msg": "OCS 脚本不存在"}), 404
 
 
 def get_ssl_context(env=None):
@@ -524,12 +583,21 @@ def run_server():
     patch_connect()
     scheme = "https" if ssl_context is not None else "http"
     log_info(f"服务启动在 {scheme}://0.0.0.0:5000")
-    app.run(
-        host="0.0.0.0",
-        port=5000,
-        ssl_context=ssl_context,
-        debug=False,
-    )
+    with ExitStack() as console:
+        if not DEBUG:
+            # Release keeps only explicit model summaries on the original
+            # console; suppress Flask banners, access logs and library output.
+            console.callback(logging.disable, logging.root.manager.disable)
+            logging.disable(logging.CRITICAL)
+            quiet = console.enter_context(open(os.devnull, "w", encoding="utf-8"))
+            console.enter_context(redirect_stdout(quiet))
+            console.enter_context(redirect_stderr(quiet))
+        app.run(
+            host="0.0.0.0",
+            port=5000,
+            ssl_context=ssl_context,
+            debug=False,
+        )
 
 
 if __name__ == "__main__":

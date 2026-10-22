@@ -111,6 +111,15 @@ const ok = (data = answer) => ({ok: true, status: 200, json: async () => data});
 
 
 class UserscriptPatchTests(unittest.TestCase):
+    def test_missing_script_skips_patch_before_config_or_network_checks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            script_path = Path(directory) / "missing.user.js"
+            with patch.object(main.socket, "gethostbyname") as resolve, \
+                    patch.object(main, "log_info"):
+                main.patch_connect(script_path, {"OCS_ANSWER_TIMEOUT_SECONDS": "invalid"})
+            resolve.assert_not_called()
+            self.assertFalse(script_path.exists())
+
     def patch_script(self, script_path, env=None):
         with patch.object(main.socket, "gethostbyname", return_value="172.20.0.3"), \
                 patch("builtins.print"):
